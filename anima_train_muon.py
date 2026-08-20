@@ -35,6 +35,7 @@ from library import (
     deepspeed_utils,
     anima_block_freeze,
     anima_models,
+    anima_cuda_accel,
     anima_train_utils,
     anima_utils,
     save_utils,
@@ -204,6 +205,7 @@ class MuonAnimaTrainer:
         train_util.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+        anima_cuda_accel.set_enabled(getattr(args, "enable_cuda_acceleration", False))
 
         # backward compatibility
         if not args.skip_cache_check:
@@ -1062,9 +1064,6 @@ class MuonAnimaTrainer:
                             t5_attn_mask=t5_attn_mask,
                         )
 
-                    # Compute loss (rectified flow: target = noise - latents)
-                    target = noise - latents
-
                     # Weighting
                     weighting = anima_train_utils.compute_loss_weighting_for_anima(
                         weighting_scheme=args.weighting_scheme, sigmas=sigmas
@@ -1072,19 +1071,38 @@ class MuonAnimaTrainer:
 
                     # Loss
                     huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, None)
-                    loss = train_util.conditional_loss(
-                        model_pred.float(), target.float(), args.loss_type, "none", huber_c
+                    use_cuda_loss = (
+                        anima_cuda_accel.is_enabled()
+                        and args.loss_type == "l2"
+                        and huber_c is None
+                        and not args.masked_loss
+                        and not ("alpha_masks" in batch and batch["alpha_masks"] is not None)
+                        and weighting is not None
                     )
-                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    if use_cuda_loss:
+                        loss = anima_cuda_accel.rectified_flow_mse_loss(
+                            model_pred,
+                            latents,
+                            noise,
+                            weighting.view(-1).to(model_pred.dtype),
+                            batch["loss_weights"].to(model_pred.device, dtype=model_pred.dtype),
+                        )
+                    else:
+                        target = noise - latents
+                        loss = train_util.conditional_loss(
+                            model_pred.float(), target.float(), args.loss_type, "none", huber_c
+                        )
+                    if not use_cuda_loss and (args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None)):
                         loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3, 4])  # (B, C, T, H, W) -> (B,)
+                    if not use_cuda_loss:
+                        loss = loss.mean([1, 2, 3, 4])  # (B, C, T, H, W) -> (B,)
 
-                    if weighting is not None:
-                        loss = loss * weighting
+                        if weighting is not None:
+                            loss = loss * weighting
 
-                    loss_weights = batch["loss_weights"]
-                    loss = loss * loss_weights
-                    loss = loss.mean()
+                        loss_weights = batch["loss_weights"]
+                        loss = loss * loss_weights
+                        loss = loss.mean()
 
                     profiler.on_fwd_done()
                     accelerator.backward(loss)

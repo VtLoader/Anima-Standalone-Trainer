@@ -11,7 +11,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import anima_models, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
+from library import anima_models, anima_cuda_accel, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
 import train_network
 from library.utils import setup_logging
 
@@ -39,6 +39,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
+        anima_cuda_accel.set_enabled(getattr(args, "enable_cuda_acceleration", False))
+
         if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
             logger.warning(
                 "cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled"

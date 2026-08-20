@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from library import custom_offloading_utils
+from library import anima_cuda_accel
 from library.device_utils import clean_memory_on_device
 
 
@@ -316,6 +317,8 @@ class RMSNorm(torch.nn.Module):
 
     @torch.amp.autocast(device_type='cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if anima_cuda_accel.is_enabled() and x.is_cuda:
+            return anima_cuda_accel.rmsnorm(x, self.weight, self.eps)
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
@@ -446,8 +449,11 @@ class Attention(nn.Module):
         k = self.k_norm(k)
         v = self.v_norm(v)
         if self.is_selfattn and rope_emb is not None:
-            q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
-            k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
+            if anima_cuda_accel.is_enabled() and self.qkv_format == "bshd" and q.is_cuda and k.is_cuda:
+                q, k = anima_cuda_accel.rope_qk(q, k, rope_emb)
+            else:
+                q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
+                k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
 
         return q, k, v
 

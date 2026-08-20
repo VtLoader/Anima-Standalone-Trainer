@@ -16,9 +16,11 @@ const wss = new WebSocket.Server({ server });
 // Parse CLI argument for port
 const args = process.argv.slice(2);
 const portArg = args.find(a => a.startsWith('--port='));
+const pythonArg = args.find(a => a.startsWith('--python=') || a.startsWith('--python_path='));
 const DEFAULT_PORT = portArg
     ? parseInt(portArg.split('=')[1])
     : (parseInt(args[0]) || 3000);
+const CLI_PYTHON_PATH = pythonArg ? pythonArg.split('=').slice(1).join('=').trim() : '';
 
 // Paths
 const ROOT_DIR = path.join(__dirname, '..');
@@ -109,6 +111,7 @@ function getGlobalConfig() {
     if (fs.existsSync(GLOBAL_CONFIG_PATH)) {
         try {
             const config = TOML.parse(fs.readFileSync(GLOBAL_CONFIG_PATH, 'utf8'));
+            if (CLI_PYTHON_PATH) config.python_path = CLI_PYTHON_PATH;
             return config;
         } catch (err) {
             console.error('Failed to parse global config:', err.message);
@@ -125,8 +128,16 @@ function getGlobalConfig() {
             gemma2_path: '',
             lumina_vae_path: ''
         },
-        venv_path: path.join(ROOT_DIR, 'venv')
+        venv_path: path.join(ROOT_DIR, 'venv'),
+        python_path: CLI_PYTHON_PATH
     };
+}
+
+function resolvePythonPath(globalConfig, venvPath) {
+    const explicit = stripQuotes(globalConfig.python_path || '').trim();
+    if (explicit) return toNativePath(explicit);
+    const venv = getVenvPaths(venvPath);
+    return fs.existsSync(venv.python) ? venv.python : 'python';
 }
 
 // Serve architecture registry to frontend
@@ -189,16 +200,7 @@ async function getDetectedGPUs() {
             console.warn("nvidia-smi failed, trying python fallback...");
             const globalConfig = getGlobalConfig();
             const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
-            let pythonPath = 'python'; // Default
-            if (process.platform === 'win32') {
-                pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
-            } else {
-                pythonPath = path.join(venvPath, 'bin', 'python');
-            }
-
-            if (!fs.existsSync(pythonPath)) {
-                pythonPath = 'python';
-            }
+            const pythonPath = resolvePythonPath(globalConfig, venvPath);
 
             const pyScript = "import torch; import json; print(json.dumps([{'index': i, 'name': torch.cuda.get_device_name(i), 'memory': f'{torch.cuda.get_device_properties(i).total_memory // 1024**2} MiB'} for i in range(torch.cuda.device_count())]))";
 
@@ -245,7 +247,8 @@ function getDefaultConfig() {
                 output_name: 'my_anima_lora',
                 learning_rate: 5e-5,
                 max_train_epochs: 20,
-                mixed_precision: 'bf16'
+                mixed_precision: 'bf16',
+                enable_cuda_acceleration: false
             },
             network_arguments: {
                 network_module: 'networks.lora_anima',
@@ -948,8 +951,13 @@ function buildEnvVar(name, value) {
     return isWindows ? `$env:${name}='${value}';` : `export ${name}='${value}';`;
 }
 
+function pythonModuleCommand(pythonPath, moduleName, args) {
+    const quoted = `"${pythonPath}"`;
+    return `${isWindows ? '& ' : ''}${quoted} -m ${moduleName}${args ? ' ' + args : ''}`;
+}
+
 // Returns { gpuEnv, accelerateFlags, tpTrainCmd } or { error }
-function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
+function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch, pythonPath) {
     const ta = mergedConfig.training_arguments || {};
     const mixedPrec = ta.mixed_precision || 'bf16';
     const mode = ta.multigpu_mode || (ta.deepspeed ? 'deepspeed' : (ta.use_fsdp ? 'fsdp' : 'ddp'));
@@ -984,7 +992,11 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                 const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
                 const rawBackend = ta.tp_backend || (isWindows ? 'gloo' : 'nccl');
                 const tpBackend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
-                tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n} --tp_backend ${tpBackend} --sequence_parallel --config_file="${mergedConfigPath}"`;
+                tpTrainCmd = pythonModuleCommand(
+                    pythonPath,
+                    'torch.distributed.run',
+                    `--nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n} --tp_backend ${tpBackend} --sequence_parallel --config_file="${mergedConfigPath}"`
+                );
 
             } else if (mode === 'fsdp2') {
                 const reshard = ta.fsdp2_reshard_after_forward ?? true;
@@ -1061,10 +1073,11 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
 }
 
 function buildShellScript(activatePath, envVars, command) {
+    const activate = activatePath && fs.existsSync(activatePath);
     if (isWindows) {
-        return `& "${activatePath}";\n${envVars}\n${command}`;
+        return `${activate ? `& "${activatePath}";\n` : ''}${envVars}\n${command}`;
     } else {
-        return `source "${activatePath}"\n${envVars}\n${command}`;
+        return `${activate ? `source "${activatePath}"\n` : ''}${envVars}\n${command}`;
     }
 }
 
@@ -1207,6 +1220,8 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
         const globalConfig = getGlobalConfig();
         const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
         const venv = getVenvPaths(venvPath);
+        const pythonPath = resolvePythonPath(globalConfig, venvPath);
+        const activatePath = (globalConfig.python_path || '').trim() ? '' : venv.activate;
 
         // Resolve architecture from job config
         const genArch = getArchForJob(mergedConfig);
@@ -1312,8 +1327,12 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                     buildEnvVar('LOG_LEVEL', 'DEBUG'),
                     gpuEnv
                 ].filter(Boolean).join('\n');
-                const launchCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
-                const script = buildShellScript(venv.activate, envVars, launchCmd);
+                const launchCmd = pythonModuleCommand(
+                    pythonPath,
+                    'accelerate.commands.launch',
+                    `--num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`
+                );
+                const script = buildShellScript(activatePath, envVars, launchCmd);
 
                 console.log("Starting persistent generation server...");
                 const proc = spawnShell(script, ROOT_DIR);
@@ -1393,8 +1412,12 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                 buildEnvVar('PYTHONIOENCODING', 'utf-8'),
                 gpuEnv
             ].filter(Boolean).join('\n');
-            const oneShotCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
-            const oneShotScript = buildShellScript(venv.activate, oneShotEnvVars, oneShotCmd);
+            const oneShotCmd = pythonModuleCommand(
+                pythonPath,
+                'accelerate.commands.launch',
+                `--num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`
+            );
+            const oneShotScript = buildShellScript(activatePath, oneShotEnvVars, oneShotCmd);
 
             const oneShotProc = spawnShell(oneShotScript, ROOT_DIR);
 
@@ -1537,6 +1560,8 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const globalConfig = getGlobalConfig();
         const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
         const venv = getVenvPaths(venvPath);
+        const pythonPath = resolvePythonPath(globalConfig, venvPath);
+        const activatePath = (globalConfig.python_path || '').trim() ? '' : venv.activate;
 
         const jobArch = getArchForJob(mergedConfig);
         const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
@@ -1549,7 +1574,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             console.warn("Failed to parse config for GPU options:", err);
         }
 
-        const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
+        const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch, pythonPath);
         if (launch.error) return res.status(400).json({ error: launch.error });
         const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
 
@@ -1562,7 +1587,11 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         } else {
             const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
             const targetScript = path.join(ROOT_DIR, scriptName);
-            trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
+            trainCmd = pythonModuleCommand(
+                pythonPath,
+                'accelerate.commands.launch',
+                `--num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`
+            );
         }
 
         // Spawn training process
@@ -1577,7 +1606,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             (isWindows && isMultiGpu) ? buildEnvVar('MASTER_ADDR', '127.0.0.1') : '',
             (isWindows && isMultiGpu) ? buildEnvVar('MASTER_PORT', '29500') : ''
         ].filter(Boolean).join('\n');
-        const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
+        const trainScript = buildShellScript(activatePath, trainEnvVars, trainCmd);
 
         const scriptPath = path.join(jobPath, isWindows ? 'launch_command.ps1' : 'launch_command.sh');
         fs.writeFileSync(scriptPath, trainScript, 'utf8');
@@ -1676,11 +1705,17 @@ app.post('/api/jobs/:name/tensorboard', (req, res) => {
         const globalConfig = getGlobalConfig();
         const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
         const venv = getVenvPaths(venvPath);
+        const pythonPath = resolvePythonPath(globalConfig, venvPath);
+        const activatePath = (globalConfig.python_path || '').trim() ? '' : venv.activate;
 
         const port = nextTbPort++;
 
-        const tbCmd = `python -m tensorboard.main --logdir="${logsDir}" --port=${port} --host=0.0.0.0`;
-        const tbScript = buildShellScript(venv.activate, '', tbCmd);
+        const tbCmd = pythonModuleCommand(
+            pythonPath,
+            'tensorboard.main',
+            `--logdir="${logsDir}" --port=${port} --host=0.0.0.0`
+        );
+        const tbScript = buildShellScript(activatePath, '', tbCmd);
         const proc = spawnShell(tbScript, ROOT_DIR);
 
         proc.stderr.on('data', (data) => {

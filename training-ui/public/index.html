@@ -261,6 +261,10 @@
                             <label><input type="checkbox" id="cfg-flash-attn"> Flash Attention</label>
                             <small>Requires flash-attn package.</small>
                         </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-cuda-acceleration"> Enable CUDA acceleration</label>
+                            <small>Uses installed anima-cuda-ops for supported Anima non-attention ops.</small>
+                        </div>
                         <div id="group-torch-compile" class="form-group">
                             <label><input type="checkbox" id="cfg-torch-compile"> Torch Compile</label>
                             <small>Uses dynamo inductor backend. Slower first step, faster training after.</small>
@@ -1038,6 +1042,12 @@
                         <label>Python Venv Path</label>
                         <input type="text" id="cfg-global-venv" placeholder="C:\sd-scripts\venv">
                         <small>Path to the Python virtual environment with training dependencies.</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Python Executable Path</label>
+                        <input type="text" id="cfg-global-python" placeholder="D:\anima_trainer_ref\venv\Scripts\python.exe">
+                        <small>Optional. Overrides venv path for training, generation, TensorBoard, and GPU detection.</small>
                     </div>
 
                     <div class="form-group" style="margin-top: 15px;">

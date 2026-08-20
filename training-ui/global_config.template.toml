@@ -1,4 +1,5 @@
 venv_path = ""
+python_path = ""
 
 [model_paths]
 # Anima Paths

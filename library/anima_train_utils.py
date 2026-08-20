@@ -29,6 +29,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from library import anima_models, anima_utils, save_utils, strategy_base, train_util
+from library import anima_cuda_accel
 
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler, get_sigmas
 
@@ -144,6 +145,11 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use Flash Attention for DiT self/cross-attention (requires flash-attn package).",
     )
+    parser.add_argument(
+        "--enable_cuda_acceleration",
+        action="store_true",
+        help="Use installed anima-cuda-ops kernels for supported Anima non-attention hot paths.",
+    )
 
 
 # Noise & Timestep sampling (Rectified Flow)
@@ -204,6 +210,8 @@ def get_noisy_model_input_and_timesteps(
         if getattr(args, 'ip_noise_gamma_random_strength', False):
             ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * ip_noise_gamma
         noisy_model_input = (1 - t_expanded) * latents + t_expanded * (noise + ip_noise_gamma * xi)
+    elif anima_cuda_accel.is_enabled() and latents.is_cuda:
+        noisy_model_input = anima_cuda_accel.noisy_input(latents, noise, t.to(latents.dtype))
     else:
         noisy_model_input = (1 - t_expanded) * latents + t_expanded * noise
 

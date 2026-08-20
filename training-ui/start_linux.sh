@@ -12,7 +12,7 @@ if [ ! -d "node_modules" ]; then
 fi
 
 # Start the application
-npm start
+npm start -- "$@"
 
 echo ""
 echo "Application exited (check for errors above)."

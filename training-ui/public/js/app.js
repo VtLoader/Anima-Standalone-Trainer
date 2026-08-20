@@ -386,6 +386,7 @@ function populateConfig(config) {
   $("cfg-grad-acc").value = t.gradient_accumulation_steps ?? 1;
   $("cfg-gradient-checkpointing").checked = t.gradient_checkpointing ?? true;
   $("cfg-flash-attn").checked = t.flash_attn ?? false;
+  $("cfg-cuda-acceleration").checked = t.enable_cuda_acceleration ?? false;
   $("cfg-torch-compile").checked = t.torch_compile ?? false;
   $("cfg-lowram").checked = t.lowram ?? false;
   $("cfg-blocks-to-swap").value = t.blocks_to_swap ?? 0;
@@ -683,6 +684,7 @@ function gatherConfig() {
       max_grad_norm: 1.0,
       gradient_checkpointing: $("cfg-gradient-checkpointing").checked,
       flash_attn: $("cfg-flash-attn").checked,
+      enable_cuda_acceleration: $("cfg-cuda-acceleration").checked,
       torch_compile: $("cfg-torch-compile").checked,
       lowram: $("cfg-lowram").checked,
       blocks_to_swap: safeInt($("cfg-blocks-to-swap").value),
@@ -2256,6 +2258,7 @@ async function loadGlobalSettings() {
     }
   }
   $("cfg-global-venv").value = config.venv_path || "";
+  $("cfg-global-python").value = config.python_path || "";
   // Theme
   const theme = config.ui?.theme || "github-dark";
   $("cfg-theme").value = theme;
@@ -2305,6 +2308,7 @@ async function saveGlobalSettings() {
   const config = {
     model_paths,
     venv_path: $("cfg-global-venv").value,
+    python_path: $("cfg-global-python").value,
     ui: {
       ...(existingConfig.ui || {}),
       theme: $("cfg-theme").value,

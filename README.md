@@ -54,9 +54,18 @@ To start the training server and open the web interface:
 .\training-ui\start_training_ui_anima.bat
 ```
 
+Optional explicit Python executable:
+```cmd
+.\training-ui\start_training_ui_anima.bat --python="D:\anima_trainer_ref\venv\Scripts\python.exe"
+```
+
 **Linux:**
 ```bash
 ./training-ui/start_linux.sh
+```
+Optional explicit Python executable:
+```bash
+./training-ui/start_linux.sh --python=/path/to/venv/bin/python
 ```
 Once launched, open your browser to: `http://localhost:3000`
 
