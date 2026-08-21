@@ -150,6 +150,14 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use installed anima-cuda-ops kernels for supported Anima non-attention hot paths.",
     )
+    parser.add_argument(
+        "--cuda_graph",
+        action="store_true",
+        help="(experimental) Capture the fixed-shape DiT forward+loss+backward as a CUDA "
+        "graph to remove per-kernel launch overhead. Requires --enable_cuda_acceleration, "
+        "single-GPU, no block swap / offload / gradient checkpointing, and l2 unmasked loss. "
+        "Falls back to eager automatically on any capture/shape issue.",
+    )
 
 
 # Noise & Timestep sampling (Rectified Flow)

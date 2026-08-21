@@ -39,6 +39,8 @@ from library.config_util import (
 )
 from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
 
+from library.cuda_graph_util import MaybeGraphedStep
+
 
 def _parse_resolution_schedule(schedule_str: str, total_steps: int):
     """Parse "RES:FRAC,RES:FRAC,..." into [(resolution, step_end), ...].
@@ -497,6 +499,9 @@ class AnimaTrainer:
 
         # Block swap
         is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
+        # CUDA-graph step capture is set up per epoch before the step loop when
+        # all gates hold; default to disabled.
+        self._graphed_step = None
         if is_swapping_blocks:
             logger.info(f"Enable block swap: blocks_to_swap={args.blocks_to_swap}")
             dit.enable_block_swap(args.blocks_to_swap, accelerator.device)
@@ -894,6 +899,48 @@ class AnimaTrainer:
             for m in training_models:
                 m.train()
 
+            # Experimental CUDA-graph step capture (--cuda_graph): engages only for
+            # single-GPU, no swap / offload / gradient checkpointing, l2 unmasked loss.
+            # Any capture/shape failure makes MaybeGraphedStep fall back to eager.
+            if (
+                getattr(args, "cuda_graph", False)
+                and anima_cuda_accel.is_enabled()
+                and accelerator.num_processes == 1
+                and not is_swapping_blocks
+                and not getattr(args, "cpu_offload_checkpointing", False)
+                and not getattr(args, "unsloth_offload_checkpointing", False)
+                and not args.gradient_checkpointing
+                and not args.fused_backward_pass
+                and not args.blockwise_fused_optimizers
+                and args.loss_type == "l2"
+                and not args.masked_loss
+            ):
+                if self._graphed_step is None:
+                    wd = weight_dtype
+
+                    def _graph_step(x, t, cross, pm, lat, noi, wgt, lw):
+                        with torch.autocast(device_type=accelerator.device.type, dtype=wd):
+                            mp = dit(x, t, cross, padding_mask=pm)
+                        loss = anima_cuda_accel.rectified_flow_mse_loss(mp, lat, noi, wgt, lw)
+                        loss.backward()
+                        return loss
+
+                    def _zero_grads():
+                        # zero_ (not set_to_none) before capture: keeps the
+                        # capture-time AccumulateGrad binding on the same buffer.
+                        for g in optimizer.param_groups:
+                            for p in g["params"]:
+                                if p.grad is not None:
+                                    p.grad.zero_()
+
+                    self._graphed_step = MaybeGraphedStep(
+                        _graph_step, enabled=True, logger=logger, zero_grad_fn=_zero_grads
+                    )
+                    logger.info("CUDA-graph training step ENABLED via --cuda_graph")
+                    torch.cuda.synchronize()
+            else:
+                self._graphed_step = None
+
             for step, batch in enumerate(train_dataloader):
                 current_step.value = global_step
 
@@ -990,65 +1037,89 @@ class AnimaTrainer:
                     if is_swapping_blocks:
                         accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
 
-                    with accelerator.autocast():
-                        model_pred = dit(
-                            noisy_model_input,
-                            timesteps,
-                            prompt_embeds,
-                            padding_mask=padding_mask,
-                            source_attention_mask=attn_mask,
-                            t5_input_ids=t5_input_ids,
-                            t5_attn_mask=t5_attn_mask,
-                        )
-
-                    # Weighting
+                    # Weighting (needed by both the eager path and the CUDA-graph path)
                     weighting = anima_train_utils.compute_loss_weighting_for_anima(
                         weighting_scheme=args.weighting_scheme, sigmas=sigmas
                     )
 
-                    # Loss
-                    huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, None)
-                    use_cuda_loss = (
-                        anima_cuda_accel.is_enabled()
-                        and args.loss_type == "l2"
-                        and huber_c is None
-                        and not args.masked_loss
-                        and not ("alpha_masks" in batch and batch["alpha_masks"] is not None)
-                        and weighting is not None
-                    )
-                    if use_cuda_loss:
-                        loss = anima_cuda_accel.rectified_flow_mse_loss(
-                            model_pred,
+                    # CUDA-graph path (experimental --cuda_graph): forward + fused
+                    # loss + backward all run inside one captured graph.
+                    if (
+                        self._graphed_step is not None
+                        and not (args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None))
+                    ):
+                        use_cuda_loss = True
+                        profiler.on_fwd_done()
+                        loss = self._graphed_step(
+                            noisy_model_input,
+                            timesteps,
+                            prompt_embeds,
+                            padding_mask,
                             latents,
                             noise,
-                            weighting.view(-1).to(model_pred.dtype),
-                            batch["loss_weights"].to(model_pred.device, dtype=model_pred.dtype),
+                            weighting.view(-1).to(weight_dtype),
+                            batch["loss_weights"].to(accelerator.device, dtype=weight_dtype),
                         )
+                        profiler.on_bwd_done()
                     else:
-                        target = noise - latents
-                        loss = train_util.conditional_loss(
-                            model_pred.float(), target.float(), args.loss_type, "none", huber_c
+                        with accelerator.autocast():
+                            model_pred = dit(
+                                noisy_model_input,
+                                timesteps,
+                                prompt_embeds,
+                                padding_mask=padding_mask,
+                                source_attention_mask=attn_mask,
+                                t5_input_ids=t5_input_ids,
+                                t5_attn_mask=t5_attn_mask,
+                            )
+
+                        # Loss
+                        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, None)
+                        use_cuda_loss = (
+                            anima_cuda_accel.is_enabled()
+                            and args.loss_type == "l2"
+                            and huber_c is None
+                            and not args.masked_loss
+                            and not ("alpha_masks" in batch and batch["alpha_masks"] is not None)
+                            and weighting is not None
                         )
-                    if not use_cuda_loss and (args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None)):
-                        loss = apply_masked_loss(loss, batch)
-                    if not use_cuda_loss:
-                        loss = loss.mean([1, 2, 3, 4])  # (B, C, T, H, W) -> (B,)
+                        if use_cuda_loss:
+                            loss = anima_cuda_accel.rectified_flow_mse_loss(
+                                model_pred,
+                                latents,
+                                noise,
+                                weighting.view(-1).to(model_pred.dtype),
+                                batch["loss_weights"].to(model_pred.device, dtype=model_pred.dtype),
+                            )
+                        else:
+                            target = noise - latents
+                            loss = train_util.conditional_loss(
+                                model_pred.float(), target.float(), args.loss_type, "none", huber_c
+                            )
+                        if not use_cuda_loss and (args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None)):
+                            loss = apply_masked_loss(loss, batch)
+                        if not use_cuda_loss:
+                            loss = loss.mean([1, 2, 3, 4])  # (B, C, T, H, W) -> (B,)
 
-                        if weighting is not None:
-                            loss = loss * weighting
+                            if weighting is not None:
+                                loss = loss * weighting
 
-                        loss_weights = batch["loss_weights"]
-                        loss = loss * loss_weights
-                        loss = loss.mean()
+                            loss_weights = batch["loss_weights"]
+                            loss = loss * loss_weights
+                            loss = loss.mean()
 
-                    profiler.on_fwd_done()
-                    accelerator.backward(loss)
-                    profiler.on_bwd_done()
+                        profiler.on_fwd_done()
+                        accelerator.backward(loss)
+                        profiler.on_bwd_done()
                     self.sync_gradients(dit)
                     profiler.on_comm_done()
 
                     if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
-                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                        if (
+                            accelerator.sync_gradients
+                            and args.max_grad_norm != 0.0
+                            and not anima_cuda_accel.optimizer_handles_clip(optimizer)
+                        ):
                             params_to_clip = []
                             for m in training_models:
                                 params_to_clip.extend(m.parameters())
@@ -1069,7 +1140,11 @@ class AnimaTrainer:
 
                         optimizer.step()
                         lr_scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
+                        # CUDA-graph step keeps param.grad bound to the capture-time
+                        # buffer (graphs only record kernel launches, not the autograd
+                        # param.grad rebinding). Zero in place (set_to_none=False) so the
+                        # binding survives; eager mode keeps stock behaviour.
+                        optimizer.zero_grad(set_to_none=(self._graphed_step is None))
                     else:
                         # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
                         lr_scheduler.step()

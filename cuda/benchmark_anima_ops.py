@@ -1,10 +1,10 @@
 import argparse
 import json
-import time
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
+from triton.testing import do_bench
 
 import anima_cuda_ops as ops
 
@@ -36,21 +36,10 @@ def _sync():
     torch.cuda.synchronize()
 
 
-def run_for_time(fn: Callable, warmup_seconds: float, bench_seconds: float) -> float:
-    end = time.perf_counter() + warmup_seconds
-    while time.perf_counter() < end:
-        fn()
-    _sync()
-
-    iters = 0
-    start = time.perf_counter()
-    end = start + bench_seconds
-    while time.perf_counter() < end:
-        fn()
-        iters += 1
-    _sync()
-    elapsed = time.perf_counter() - start
-    return elapsed * 1000.0 / max(iters, 1)
+def run_for_time(fn: Callable, warmup_ms: float, rep_ms: float) -> float:
+    # Use triton.testing.do_bench: warmup/rep are in milliseconds and it returns
+    # the mean per-iteration time in milliseconds.
+    return float(do_bench(fn, warmup=int(warmup_ms), rep=int(rep_ms)))
 
 
 def error(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
@@ -62,8 +51,8 @@ def error(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
     return max_abs, linf_rel
 
 
-def bench_rmsnorm(dtype, warmup, bench) -> BenchResult:
-    B, T, H, W, D = 2, 1, 64, 64, 1536
+def bench_rmsnorm(dtype, warmup, bench, scale=1) -> BenchResult:
+    B, T, H, W, D = 2 * scale, 1, 64, 64, 1536
     x = torch.randn(B, T, H, W, D, device="cuda", dtype=dtype)
     w = torch.randn(D, device="cuda", dtype=dtype)
     ref = lambda: ops.rmsnorm_ref(x, w, 1e-6)
@@ -77,8 +66,8 @@ def bench_rmsnorm(dtype, warmup, bench) -> BenchResult:
     return BenchResult("rmsnorm", str(dtype).replace("torch.", ""), str(tuple(x.shape)), ref_ms, cuda_ms, ref_ms / cuda_ms, max_abs, max_rel)
 
 
-def bench_rope(dtype, warmup, bench) -> BenchResult:
-    B, S, H, D = 2, 4096, 16, 96
+def bench_rope(dtype, warmup, bench, scale=1) -> BenchResult:
+    B, S, H, D = 2, 4096 * scale, 16, 96
     q = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
     k = torch.randn_like(q)
     freqs = torch.randn(S, D, device="cuda", dtype=dtype)
@@ -94,8 +83,8 @@ def bench_rope(dtype, warmup, bench) -> BenchResult:
     return BenchResult("rope_qk", str(dtype).replace("torch.", ""), str(tuple(q.shape)), ref_ms, cuda_ms, ref_ms / cuda_ms, max(max_abs_q, max_abs_k), max(max_rel_q, max_rel_k))
 
 
-def bench_noisy(dtype, warmup, bench) -> BenchResult:
-    B, C, T, H, W = 2, 16, 1, 128, 128
+def bench_noisy(dtype, warmup, bench, scale=1) -> BenchResult:
+    B, C, T, H, W = 2 * scale, 16, 1, 128, 128
     latents = torch.randn(B, C, T, H, W, device="cuda", dtype=dtype)
     noise = torch.randn_like(latents)
     t = torch.rand(B, device="cuda", dtype=dtype).clamp(1e-5, 1 - 1e-5)
@@ -110,8 +99,8 @@ def bench_noisy(dtype, warmup, bench) -> BenchResult:
     return BenchResult("noisy_input", str(dtype).replace("torch.", ""), str(tuple(latents.shape)), ref_ms, cuda_ms, ref_ms / cuda_ms, max_abs, max_rel)
 
 
-def bench_loss(dtype, warmup, bench) -> BenchResult:
-    B, C, T, H, W = 2, 16, 1, 128, 128
+def bench_loss(dtype, warmup, bench, scale=1) -> BenchResult:
+    B, C, T, H, W = 2 * scale, 16, 1, 128, 128
     model_pred = torch.randn(B, C, T, H, W, device="cuda", dtype=dtype)
     latents = torch.randn_like(model_pred)
     noise = torch.randn_like(model_pred)
@@ -211,8 +200,8 @@ def bench_realistic_anima_lora(dtype, warmup, bench, batch_size, image_size, blo
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--warmup-seconds", type=float, default=1.0)
-    parser.add_argument("--bench-seconds", type=float, default=5.0)
+    parser.add_argument("--warmup-ms", type=float, default=500.0, help="triton do_bench warmup in ms (default 500)")
+    parser.add_argument("--rep-ms", type=float, default=5000.0, help="triton do_bench rep in ms (default 5000)")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32", "all"], default="bf16")
     parser.add_argument("--mode", choices=["micro", "realistic", "both"], default="micro")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -221,12 +210,16 @@ def main():
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--model-dim", type=int, default=1536)
     parser.add_argument("--verbose-build", action="store_true")
+    parser.add_argument("--scale", type=int, default=1, help="linearly enlarge micro-benchmark shapes (>=1)")
+    parser.add_argument("--profile-memory", action="store_true", help="report peak GPU memory usage")
     args = parser.parse_args()
 
-    if args.warmup_seconds < 1.0:
-        raise ValueError("Each operator warmup must be at least 1s")
-    if args.bench_seconds < 5.0:
-        raise ValueError("Each operator benchmark must be at least 5s")
+    if args.warmup_ms < 0.0:
+        raise ValueError("warmup must be >= 0 ms")
+    if args.rep_ms < 0.0:
+        raise ValueError("rep must be >= 0 ms")
+    if args.scale < 1:
+        raise ValueError("scale must be >= 1")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
 
@@ -237,6 +230,11 @@ def main():
     print(f"Capability: {torch.cuda.get_device_capability(0)}")
     print(f"Total memory GiB: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}")
     print(f"Torch: {torch.__version__}, CUDA: {torch.version.cuda}")
+    print(f"Scale: {args.scale}x")
+
+    if args.profile_memory:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtypes = list(dtype_map.values()) if args.dtype == "all" else [dtype_map[args.dtype]]
@@ -245,14 +243,14 @@ def main():
     for dtype in dtypes:
         if args.mode in ("micro", "both"):
             for bench_fn in (bench_rmsnorm, bench_rope, bench_noisy, bench_loss):
-                result = bench_fn(dtype, args.warmup_seconds, args.bench_seconds)
+                result = bench_fn(dtype, args.warmup_ms, args.rep_ms, args.scale)
                 results.append(result)
                 print(json.dumps(result.__dict__, ensure_ascii=False))
         if args.mode in ("realistic", "both"):
             result = bench_realistic_anima_lora(
                 dtype,
-                args.warmup_seconds,
-                args.bench_seconds,
+                args.warmup_ms,
+                args.rep_ms,
                 args.batch_size,
                 args.image_size,
                 args.blocks,
@@ -261,6 +259,26 @@ def main():
             )
             results.append(result)
             print(json.dumps(result.__dict__, ensure_ascii=False))
+
+    if args.profile_memory:
+        torch.cuda.synchronize()
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        peak_alloc = torch.cuda.max_memory_allocated() / 1024**3
+        peak_res = torch.cuda.max_memory_reserved() / 1024**3
+        print(
+            json.dumps(
+                {
+                    "memory": {
+                        "total_vram_gib": round(total, 2),
+                        "peak_allocated_gib": round(peak_alloc, 2),
+                        "peak_reserved_gib": round(peak_res, 2),
+                        "pct_of_vram": round(100.0 * peak_alloc / total, 1),
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

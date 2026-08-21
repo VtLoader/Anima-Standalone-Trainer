@@ -60,7 +60,7 @@ from diffusers import (
     KDPM2AncestralDiscreteScheduler,
     AutoencoderKL,
 )
-from library import custom_train_functions, sd3_utils
+from library import anima_cuda_accel, custom_train_functions, sd3_utils
 from library.original_unet import UNet2DConditionModel
 from huggingface_hub import hf_hub_download
 import numpy as np
@@ -5128,8 +5128,23 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
 
     elif optimizer_type == "AdamW".lower():
         logger.info(f"use AdamW optimizer | {optimizer_kwargs}")
-        optimizer_class = torch.optim.AdamW
-        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+        # Fused CUDA AdamW step when --enable_cuda_acceleration (fp32/CUDA),
+        # otherwise falls back to the stock torch.optim.AdamW behaviour.
+        # When accel is on and max_grad_norm > 0, the global-norm grad clip is
+        # folded into the fused kernel (FusedAdamW.max_grad_norm); the trainer
+        # path can then skip its own clip_grad_norm_ via
+        # anima_cuda_accel.optimizer_handles_clip().
+        fused_max_grad_norm = (
+            getattr(args, "enable_cuda_acceleration", False) and getattr(args, "max_grad_norm", 0.0) is not None
+            and args.max_grad_norm > 0.0
+        )
+        optimizer_class = anima_cuda_accel.FusedAdamW
+        optimizer = optimizer_class(
+            trainable_params,
+            lr=lr,
+            max_grad_norm=args.max_grad_norm if fused_max_grad_norm else None,
+            **optimizer_kwargs,
+        )
 
     elif optimizer_type.endswith("schedulefree".lower()):
         try:

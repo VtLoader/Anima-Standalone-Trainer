@@ -162,3 +162,114 @@ Delta:
 - Peak allocated reduction: `48.00 MiB`
 - Peak reserved reduction: `76.00 MiB`
 - Runtime speedup in this simulation: `4.49x`
+
+## Optimized results (after GPU-targeted changes)
+
+The initial results above predate the GPU-targeted optimizations (vectorized RMSNorm,
+pair-based RoPE with shared sincos, multi-block loss reduction, and fused backward
+kernels). Re-run on the same RTX 4060 Laptop (CC 8.9) with the rebuilt wheel, timed with
+`triton.testing.do_bench` (`--warmup-ms 500 --rep-ms 5000`).
+
+### Forward micro-benchmark (same script, `--dtype all`, triton `do_bench`)
+
+| Op | Dtype | Before (wall-clock) | After (do_bench) |
+| --- | --- | ---: | ---: |
+| rmsnorm | bfloat16 | 9.87x | 9.98x |
+| rmsnorm | float16 | 9.93x | 9.91x |
+| rmsnorm | float32 | 3.41x | 3.34x |
+| rope_qk | bfloat16 | 6.02x | 5.72x |
+| rope_qk | float16 | 6.02x | 5.71x |
+| rope_qk | float32 | 5.87x | 5.95x |
+| noisy_input | bfloat16 | 4.70x | 1.88x |
+| noisy_input | float16 | 4.31x | 1.91x |
+| noisy_input | float32 | 4.92x | 1.43x |
+| rectified_flow_mse_loss | bfloat16 | 7.33x | 2.42x |
+| rectified_flow_mse_loss | float16 | **1.00x** | **2.40x** |
+| rectified_flow_mse_loss | float32 | 5.30x | 1.72x |
+
+`do_bench` flushes the CUDA cache between every iteration, so the tiny elementwise
+operators (`noisy_input`, `rectified_flow_mse_loss`, ~0.03-0.11 ms) are dominated by
+launch/cache overhead and show compressed ratios. The memory-bound operators (`rmsnorm`,
+`rope_qk`) are stable at ~10x and ~5.7x. The loss fp16 operator previously gave no
+speedup under the old methodology (`1.00x`, one block per sample) and now beats the
+reference; its absolute win is best seen in the realistic multi-block simulation.
+
+### Backward micro-benchmark (`bench_backward.py`, CUDA vs Python reference, triton `do_bench`)
+
+The backward pass was previously pure Python (fp32 upcast + several tensor kernels); it is
+now fused CUDA.
+
+| Op | Dtype | Speedup |
+| --- | --- | ---: |
+| rmsnorm_backward | bfloat16 | 4.0x |
+| rmsnorm_backward | float16 | 4.1x |
+| rmsnorm_backward | float32 | 2.6x |
+| rope_backward | bfloat16 | 5.8x |
+| rope_backward | float16 | 5.7x |
+| rope_backward | float32 | 5.9x |
+| rectified_flow_mse_loss_backward | bfloat16 | 3.6x |
+| rectified_flow_mse_loss_backward | float16 | 3.5x |
+| rectified_flow_mse_loss_backward | float32 | 1.6x |
+
+Correctness of all forward and backward operators (vs `*_ref` reference implementations)
+is verified for bf16/fp16/fp32 by `verify_optimized.py`.
+
+## Large-data scaling (bf16, RTX 4060 8GB)
+
+The benchmark script supports `--scale N` (enlarge micro shapes) and `--profile-memory`
+(report peak GPU usage). Larger workloads amortize launch/cache overhead and hold or
+improve speedups.
+
+| Micro op | Size | Speedup |
+| --- | --- | ---: |
+| rmsnorm `--scale 16` | rows 32·4096, cols 1536 (~402M elems) | 10.26x |
+| rope_qk `--scale 16` | S=65536 long sequence | 6.63x |
+| noisy_input `--scale 16` | batch 32 | 1.82x |
+| rectified_flow_mse_loss `--scale 16` | batch 32 | 4.98x |
+
+Worst micro peak (`--scale 16 --profile-memory`): 5.26 GiB allocated (65.8% VRAM).
+
+| Realistic | Config | Speedup | Peak VRAM |
+| --- | --- | ---: | ---: |
+| 1024px b2 | seq=4096, 28 blocks | 3.23x | -- |
+| 2048px b2 | seq=16384, 28 blocks | 3.55x | 2.53 GiB (31.6%) |
+
+All runs stay well under the 8 GiB budget.
+
+## New fused operators (fused LayerNorm+AdaLN, fused AdamW)
+
+Two more hot training operators were added, timed with triton `do_bench` on the RTX 4060
+(8GB). Correctness is verified by `verify_new_ops.py` (bf16/fp16/fp32 forward+backward,
+autograd, and the AdamW step vs the torch reference).
+
+| Op | Shape / workload | Speedup |
+| --- | --- | ---: |
+| adaln_norm forward | (B,T,H,W,D)=(2,1,64,64,2048) fp32 | 4.8x |
+| adaln_norm backward | same; includes grad_x + grad_scale/grad_shift | 5.4x |
+| adamw_step | 8M-param fp32 master weights | 3.0x |
+
+The `adaln_norm` backward reduces grad_scale/grad_shift by chunking each batch-timestep's
+spatial rows across many blocks with `atomicAdd`, since `B*T` alone (e.g. 2) would leave
+the GPU under-occupied.
+
+## Precision validation of the optimized ops
+
+Beyond timing, the optimized operators are checked against the **original torch path a real
+`Block` actually executes** (not just a shared hand-written reference): `precision_compare.py`
+runs a real `Block` (self/cross attention, AdaLN, QK-RMSNorm, RoPE) plus `noisy_input` and the
+flow loss under `--enable_cuda_acceleration` off (original torch path) vs on (fused), and
+`gradcheck_ops.py` verifies each fused backward with independent finite differences.
+
+This full-pipeline fp32 comparison caught a **real fused-RoPE-backward bug**: self-attention
+q/k weight gradients disagreed with the original torch path by ~0.9 relative error. The kernel
+reused the forward rotation's `sin[d]` for the backward's crossed term; the transpose requires
+`sin[mate]`. Fixed with a `use_mate_sin` flag (`rope_forward` uses `sin[d]`, `rope_backward`
+uses `sin[mate]`) and the reference was corrected to match.
+
+After the fix, the full-pipeline comparison is at machine precision in fp32:
+
+- fp32: forward outputs and all parameter gradients ~1e-6 relative.
+- fp16: ~1e-3 relative (normal mixed-precision noise).
+- bf16: ~1e-2 relative (normal bf16 rounding).
+- `gradcheck_ops.py` finite-difference check passes to ~1e-3 relative for rmsnorm, rope (q/k),
+  and adaln_norm backward.

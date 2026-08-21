@@ -1111,7 +1111,11 @@ class MuonAnimaTrainer:
                     profiler.on_comm_done()
 
                     if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
-                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                        if (
+                            accelerator.sync_gradients
+                            and args.max_grad_norm != 0.0
+                            and not anima_cuda_accel.optimizer_handles_clip(optimizer)
+                        ):
                             params_to_clip = []
                             for m in training_models:
                                 params_to_clip.extend(m.parameters())

@@ -4,10 +4,12 @@ This folder contains non-FlashAttention CUDA operator experiments for the Anima 
 
 Implemented operators:
 
-- `rmsnorm`: fused forward for Anima/QK/timestep RMSNorm-like usage.
-- `rope_qk`: fused non-interleaved RoPE for q/k tensors shaped `(B, S, H, D)`.
+- `rmsnorm`: fused forward **and backward** for Anima/QK/timestep RMSNorm-like usage.
+- `rope_qk`: fused non-interleaved RoPE for q/k tensors shaped `(B, S, H, D)`, forward and backward.
 - `noisy_input`: rectified-flow blend `(1 - t) * latents + t * noise`.
-- `rectified_flow_mse_loss`: fused `target = noise - latents`, MSE, per-sample reduction, weighting, and final mean.
+- `rectified_flow_mse_loss`: fused `target = noise - latents`, MSE, per-sample reduction, weighting, and final mean, forward and backward.
+- `adaln_norm`: fused LayerNorm(affine=False) + AdaLN scale/shift modulation, forward and backward.
+- `adamw_step`: fused AdamW optimizer step (decoupled weight decay).
 
 The extension is loaded via `torch.utils.cpp_extension.load`, so it does not modify the main trainer by default.
 
@@ -124,10 +126,31 @@ Use the requested reference environment:
 & "D:\anima_trainer_ref\venv\Scripts\python.exe" "D:\Anima-Standalone-Trainer\cuda\benchmark_anima_ops.py" --dtype bf16
 ```
 
-The benchmark enforces:
+The benchmark uses `triton.testing.do_bench` for timing, with defaults:
 
-- warmup time per operator: at least 1 second
-- measured benchmark time per operator: at least 5 seconds
+- `--warmup-ms 500` (warmup 500 ms)
+- `--rep-ms 5000` (measurement rep 5000 ms)
+
+`do_bench` flushes the CUDA cache between iterations, so per-iteration times are
+comparable across operators. Both values may be overridden:
+
+```powershell
+& "D:\anima_trainer_ref\venv\Scripts\python.exe" "D:\Anima-Standalone-Trainer\cuda\benchmark_anima_ops.py" --dtype bf16 --warmup-ms 1000 --rep-ms 10000
+```
+
+To enlarge the micro-benchmark shapes, pass `--scale N` (linearly scales the sampled
+dimension of each operator) and add `--profile-memory` to report peak GPU memory usage:
+
+```powershell
+& "D:\anima_trainer_ref\venv\Scripts\python.exe" "D:\Anima-Standalone-Trainer\cuda\benchmark_anima_ops.py" --dtype bf16 --scale 16 --profile-memory
+```
+
+Large-data spot checks on the RTX 4060 8GB (bf16):
+
+- `--scale 16 --profile-memory`: rmsnorm 10.3x, rope 6.63x (S=65536), loss 5.0x; peak 5.26 GiB allocated (65.8% VRAM).
+- `--mode realistic --image-size 2048 --batch-size 2 --blocks 28 --profile-memory`: 3.55x (1353 -> 381 ms); peak 2.53 GiB (31.6% VRAM).
+
+Both stay well under the 8 GiB VRAM budget.
 
 Optional full dtype run:
 
@@ -184,3 +207,82 @@ LoRA training through `anima_train_network.py` uses the accelerated RMSNorm, RoP
 ## Notes
 
 These kernels intentionally exclude FlashAttention because the training code already supports mature FlashAttention backends. The target is the remaining smaller operators that can become visible after attention is optimized: RMSNorm, RoPE, rectified-flow elementwise work, and loss reduction.
+
+## Precision Validation
+
+Correctness of the fused operators is checked three ways:
+
+1. **`verify_optimized.py` / `verify_new_ops.py`** — fused forward/backward vs the pure-torch
+   `*_ref` implementations, bf16/fp16/fp32.
+2. **`gradcheck_ops.py`** — independent **finite-difference** gradient check of each fused
+   backward (ground truth not derived from any shared reference).
+3. **`precision_compare.py`** — full-pipeline "optimized path vs the original torch path" on a
+   real `Block` (self/cross attention, AdaLN, QK-RMSNorm, RoPE) + noisy_input + flow loss,
+   comparing forward outputs, `x` grad, and every parameter grad.
+
+### Bug found & fixed: fused RoPE backward
+
+The full-pipeline fp32 comparison initially exposed that the fused **RoPE backward was wrong**:
+the self-attention q/k weight gradients differed from the original torch path by ~0.9 relative
+error in fp32 (not a precision issue — it reproduced exactly in fp32 while other gradients were
+~1e-6). The kernel reused the forward rotation where the crossed term uses `sin[d]`, but the
+transpose requires `sin[mate]`. This silently corrupted self-attention q/k weight gradients
+during training. Fixed by adding a `use_mate_sin` flag to `rope_kernel` (forward `0`, backward
+`1`) and correcting `rope_qk_backward_ref`.
+
+After the fix, `precision_compare.py` reports (optimized vs original, a real `Block`):
+
+- fp32: forward and all gradients at ~1e-6 (machine precision).
+- fp16: ~1e-3 relative error (normal mixed-precision noise).
+- bf16: ~1e-2 relative error (normal bf16 rounding).
+
+and `gradcheck_ops.py` shows the fused backward matches finite differences to ~1e-3 relative
+for rmsnorm, rope (q/k), and adaln_norm.
+
+## Training hook-up
+
+With `--enable_cuda_acceleration` set, the fused operators are wired into the real model and
+training path via `anima_cuda_accel.is_enabled()`:
+
+| Operator | Hook point |
+| --- | --- |
+| `rmsnorm` (QK-norm / timestep-norm) | `anima_models.py` RMSNorm.forward |
+| `rope_qk` (self-attention) | `anima_models.py` Attention.compute_qkv |
+| `adaln_norm` (Block LayerNorm+AdaLN) | `anima_models.py` Block `_adaln_fn` |
+| `noisy_input` | `anima_train_utils.py` rectified-flow path |
+| `rectified_flow_mse_loss` | `anima_train.py` / `anima_train_muon.py` loss |
+| `fused_adamw_step` via `FusedAdamW` | `train_util.py` `--optimizer_type AdamW` |
+
+`FusedAdamW` subclasses `torch.optim.AdamW`; when acceleration is enabled and the master
+weights are fp32/CUDA its `step()` calls the fused CUDA kernel, otherwise it falls back to the
+stock AdamW step. Backward passes of the autograd ops are fused automatically with the forward.
+The TP/SP trainers reuse `AnimaTrainer().train()`, so the same model-path hooks apply there.
+
+## Fused global-norm grad clip (in the optimizer step)
+
+When `--enable_cuda_acceleration` is on and `--max_grad_norm > 0` with `--optimizer_type AdamW`,
+`FusedAdamW` is constructed with `max_grad_norm` and its `step()` computes the global gradient
+norm once and folds `clip_scale = min(1, max_norm / grad_norm)` into every fused kernel launch,
+so the trainer can skip its own `clip_grad_norm_` pass (`optimizer_handles_clip()`).
+`amsgrad`/`maximize` groups and sparse grads make the optimizer fall back to stock AdamW.
+
+## CUDA-graph training step (experimental, `--cuda_graph`)
+
+`--cuda_graph` captures the fixed-shape DiT forward + fused loss + backward as one CUDA graph
+(`library/cuda_graph_util.py::MaybeGraphedStep`) to strip per-kernel launch overhead.
+It engages only for: single GPU, `--enable_cuda_acceleration`, l2 unmasked loss, and no
+block swap / CPU-unsloth offload / gradient checkpointing / fused-backward. It re-captures on
+shape change and falls back to eager permanently on any capture failure. Because CUDA graphs
+record only kernel launches (not autograd's `param.grad` rebinding), the trainer zeroes
+gradients in place (`set_to_none=False`) while the graph step is active.
+
+## Loss backward saves only the residual
+
+`rectified_flow_mse_loss`'s autograd wrapper now stores the single residual
+`diff = pred - (noise - latents)` for backward instead of three full tensors, halving the
+activation kept for the fused loss while keeping the exact fp32 gradient.
+
+## Fusion skip detection
+
+`anima_cuda_accel.rmsnorm` warns once when fusion is silently bypassed (e.g. mixed activation /
+weight dtypes or CPU inputs), so "acceleration enabled but not applied" is visible in the log.

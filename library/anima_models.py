@@ -1078,8 +1078,16 @@ class Block(nn.Module):
 
         B, T, H, W, D = x_B_T_H_W_D.shape
 
-        def _adaln_fn(_x, _norm_layer, _scale, _shift):
-            return _norm_layer(_x) * (1 + _scale) + _shift
+        def _adaln_fn(_x, _norm_layer, _scale_1_1, _shift_1_1):
+            if anima_cuda_accel.is_enabled() and _x.is_cuda:
+                Dv = _x.shape[-1]
+                return anima_cuda_accel.adaln_norm(
+                    _x,
+                    _scale_1_1.reshape(-1, Dv),
+                    _shift_1_1.reshape(-1, Dv),
+                    getattr(_norm_layer, "eps", 1e-6),
+                )
+            return _norm_layer(_x) * (1 + _scale_1_1) + _shift_1_1
 
         # 1. Self-attention
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_self_attn, scale_self_attn_B_T_1_1_D, shift_self_attn_B_T_1_1_D)
@@ -1800,6 +1808,18 @@ ANIMA_VAE_STD = [
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
 
 
+def count_blocks(state_dict_keys, prefix_string):
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    return count
 def get_dit_config(state_dict, key_prefix=''):
     """Derive DiT configuration from state_dict weight shapes."""
     dit_config = {}
@@ -1823,7 +1843,9 @@ def get_dit_config(state_dict, key_prefix=''):
     dit_config["use_adaln_lora"] = True
     dit_config["adaln_lora_dim"] = 256
     if dit_config["model_channels"] == 2048:
-        dit_config["num_blocks"] = 28
+        # Count blocks from the state_dict so both the 28-layer base and the
+        # 40-layer expanded checkpoint (and anything in between) are detected.
+        dit_config["num_blocks"] = count_blocks(state_dict.keys(), '{}blocks.'.format(key_prefix) + '{}')
         dit_config["num_heads"] = 16
     elif dit_config["model_channels"] == 5120:
         dit_config["num_blocks"] = 36

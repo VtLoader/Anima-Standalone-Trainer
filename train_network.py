@@ -28,6 +28,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, save_utils, strategy_base, strategy_sd
+from library import anima_cuda_accel
 
 import copy
 
@@ -1773,7 +1774,7 @@ class NetworkTrainer:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         profiler.on_comm_done()
 
-                        if args.max_grad_norm != 0.0:
+                        if args.max_grad_norm != 0.0 and not anima_cuda_accel.optimizer_handles_clip(optimizer):
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
