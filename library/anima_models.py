@@ -314,11 +314,12 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    @torch.amp.autocast(device_type='cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        # cast back for fp32-upcast weights
-        return (output * self.weight).type_as(x)
+        # keep the original fp32 autocast policy, but target the actual device (cuda/npu/...)
+        with torch.amp.autocast(device_type=x.device.type, dtype=torch.float32):
+            output = self._norm(x.float()).type_as(x)
+            # cast back for fp32-upcast weights
+            return (output * self.weight).type_as(x)
 
 
 class GPT2FeedForward(nn.Module):
@@ -1467,7 +1468,9 @@ class MiniTrainDIT(nn.Module):
                 source_attention_mask=source_attention_mask,
             )
             if t5_attn_mask is not None:
-                crossattn_emb[~t5_attn_mask.bool()] = 0
+                # masked_fill instead of boolean-index assignment: avoids NonZero, which is
+                # not supported inside Ascend npugraph_ex captured graphs.
+                crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
@@ -1632,6 +1635,23 @@ class AdapterRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def expand_attention_mask_for_npu(mask: Optional[torch.Tensor], query_states: torch.Tensor) -> Optional[torch.Tensor]:
+    """Expand broadcast SDPA masks for Ascend NPU's fused attention kernels.
+
+    NPU requires the mask to carry the query length. Masks shaped [B, 1, 1, Skv]
+    (or [B, 1, 1, Sq]) are expanded to [B, 1, Sq, Skv]; other devices are untouched.
+    """
+    if (
+        mask is not None
+        and mask.ndim == 4
+        and mask.shape[-2] == 1
+        and query_states.shape[-2] != 1
+        and query_states.device.type == "npu"
+    ):
+        return mask.expand(mask.shape[0], mask.shape[1], query_states.shape[-2], mask.shape[-1])
+    return mask
+
+
 class LLMAdapterAttention(nn.Module):
     """Attention module for LLM Adapter with QK-norm and separate RoPE for query/key."""
 
@@ -1671,6 +1691,9 @@ class LLMAdapterAttention(nn.Module):
             query_states = _adapter_apply_rotary_pos_emb(query_states, cos, sin)
             cos, sin = position_embeddings_context
             key_states = _adapter_apply_rotary_pos_emb(key_states, cos, sin)
+
+        # Ascend NPU fused SDPA requires the mask to carry the query length.
+        mask = expand_attention_mask_for_npu(mask, query_states)
 
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 

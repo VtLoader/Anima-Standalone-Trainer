@@ -31,7 +31,7 @@ from tqdm import tqdm
 from packaging.version import Version
 
 import torch
-from library.device_utils import init_ipex, clean_memory_on_device
+from library.device_utils import init_ipex, clean_memory_on_device, is_oom_error
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
 
 init_ipex()
@@ -5679,6 +5679,92 @@ def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
             )
 
 
+def get_accelerator_device_count() -> int:
+    """Number of available accelerator devices (CUDA or Ascend NPU)."""
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+    except Exception:
+        pass
+    try:
+        if getattr(torch, "npu", None) is not None and torch.npu.is_available():
+            return torch.npu.device_count()
+    except Exception:
+        pass
+    return 0
+
+
+def is_npu_available() -> bool:
+    try:
+        return getattr(torch, "npu", None) is not None and torch.npu.is_available()
+    except Exception:
+        return False
+
+
+def apply_npu_torch_compile(args: argparse.Namespace, model: torch.nn.Module, label: str = "model") -> torch.nn.Module:
+    """Apply torch.compile for Ascend NPU when --torch_compile is requested.
+
+    accelerate's DynamoBackend enum has no Ascend graph backend, so instead of going
+    through Accelerator(dynamo_backend=...) this compiles the model's forward with
+    torch_npu's npugraph_ex backend. The module object itself is preserved (only its
+    forward call is wrapped), so DDP/accelerate/block-swap helpers keep working.
+
+    Compilation is lazy: if graph capture or execution fails on the first forward,
+    it logs a warning and falls back to eager for the rest of the run.
+    """
+    if not getattr(args, "torch_compile", False):
+        return model
+    if not is_npu_available():
+        return model
+    if getattr(args, "blocks_to_swap", None):
+        logger.warning("torch_compile is not supported with block swap on NPU; keeping eager execution.")
+        return model
+    if getattr(args, "deepspeed", False):
+        logger.warning("torch_compile is not supported with DeepSpeed; keeping eager execution.")
+        return model
+    if getattr(args, "tp_degree", 1) and int(getattr(args, "tp_degree", 1)) > 1:
+        logger.warning("torch_compile is not supported with TP/SP on NPU; keeping eager execution.")
+        return model
+    if getattr(args, "sequence_parallel", False):
+        logger.warning("torch_compile is not supported with sequence parallel on NPU; keeping eager execution.")
+        return model
+
+    backend = getattr(args, "npu_compile_backend", None) or "npugraph_ex"
+    original_forward = model.forward
+    state = {"compiled": None, "failed": False, "logged": False}
+
+    def guarded_forward(*fargs, **fkwargs):
+        if state["failed"]:
+            return original_forward(*fargs, **fkwargs)
+        if state["compiled"] is None:
+            try:
+                state["compiled"] = torch.compile(original_forward, backend=backend)
+                logger.info(f"torch.compile enabled for {label} (Ascend backend={backend})")
+            except Exception as e:
+                logger.warning(f"torch.compile setup failed for {label} ({type(e).__name__}: {e}); falling back to eager.")
+                state["failed"] = True
+                return original_forward(*fargs, **fkwargs)
+        try:
+            out = state["compiled"](*fargs, **fkwargs)
+            if not state["logged"]:
+                state["logged"] = True
+                logger.info(f"torch.compile first {label} forward succeeded (backend={backend})")
+            return out
+        except Exception as e:
+            if is_oom_error(e):
+                raise
+            logger.warning(
+                f"torch.compile execution failed for {label} ({type(e).__name__}: {str(e)[:300]}); falling back to eager."
+            )
+            state["failed"] = True
+            state["compiled"] = None
+            return original_forward(*fargs, **fkwargs)
+
+    model.forward = guarded_forward
+    logger.info(f"torch.compile requested: {label} will be compiled on first forward ({backend})")
+    return model
+
+
 def prepare_accelerator(args: argparse.Namespace):
     """
     this function also prepares deepspeed plugin
@@ -5738,7 +5824,15 @@ def prepare_accelerator(args: argparse.Namespace):
     # torch.compile のオプション。 NO の場合は torch.compile は使わない
     dynamo_backend = "NO"
     if args.torch_compile:
-        dynamo_backend = args.dynamo_backend
+        if is_npu_available():
+            # The default inductor backend needs triton; on Ascend NPU torch.compile is
+            # applied at model preparation time with torch_npu's npugraph_ex backend.
+            logger.info(
+                "torch_compile on Ascend NPU: using torch_npu npugraph_ex graph backend "
+                "(applied at model preparation; eager fallback on failure)."
+            )
+        else:
+            dynamo_backend = args.dynamo_backend
 
     _use_cuda_direct = getattr(args, "use_cuda_direct", False) and os.name == "nt" and torch.cuda.device_count() > 1
     if _use_cuda_direct:
@@ -5754,8 +5848,17 @@ def prepare_accelerator(args: argparse.Namespace):
     def _win_backend():
         if _use_cuda_direct:
             return "cuda_direct"
+        if is_npu_available():
+            return "hccl"
         return "gloo"
 
+    _accel_device_count = get_accelerator_device_count()
+    # accelerate only enters distributed mode when LOCAL_RANK/WORLD_SIZE indicate a distributed launch.
+    # Passing an explicit backend outside such a launch makes PartialState demand an initialized process group.
+    try:
+        _launched_distributed = int(os.environ.get("LOCAL_RANK", "-1")) != -1 or int(os.environ.get("WORLD_SIZE", "1")) > 1
+    except ValueError:
+        _launched_distributed = False
     kwargs_handlers = [
         (
             InitProcessGroupKwargs(
@@ -5765,7 +5868,7 @@ def prepare_accelerator(args: argparse.Namespace):
                 ),
                 timeout=datetime.timedelta(minutes=args.ddp_timeout) if args.ddp_timeout else None,
             )
-            if torch.cuda.device_count() > 1
+            if _accel_device_count > 1 and _launched_distributed
             else None
         ),
         (
@@ -6802,8 +6905,13 @@ def sample_images_common(
     # save random state to restore later
     rng_state = torch.get_rng_state()
     cuda_rng_state = None
+    npu_rng_state = None
     try:
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    except Exception:
+        pass
+    try:
+        npu_rng_state = torch.npu.get_rng_state() if is_npu_available() else None
     except Exception:
         pass
 
@@ -6834,6 +6942,8 @@ def sample_images_common(
     torch.set_rng_state(rng_state)
     if torch.cuda.is_available() and cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
+    elif npu_rng_state is not None:
+        torch.npu.set_rng_state(npu_rng_state)
     vae.to(org_vae_device)
 
     clean_memory_on_device(accelerator.device)

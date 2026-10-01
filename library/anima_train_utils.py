@@ -17,7 +17,7 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 from PIL.PngImagePlugin import PngInfo
 
-from library.device_utils import init_ipex, clean_memory_on_device
+from library.device_utils import init_ipex, clean_memory_on_device, is_oom_error, synchronize_device
 
 init_ipex()
 
@@ -685,7 +685,10 @@ def _sample_image_inference(
 
     if seed is not None:
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # seed all CUDA devices for multi-GPU
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)  # seed all CUDA devices for multi-GPU
+        elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+            torch.npu.manual_seed_all(seed)  # seed all NPU devices for multi-NPU
 
     height = max(64, height - height % 16)
     width = max(64, width - width % 16)
@@ -773,7 +776,7 @@ def _sample_image_inference(
                 sec_device = next(dit_secondary.parameters()).device
                 for block in dit_secondary.blocks:
                     weighs_to_device(block, sec_device)
-            torch.cuda.synchronize()
+            synchronize_device(accelerator.device)
             dit.blocks_to_swap = 0
             if dit_secondary is not None:
                 dit_secondary.blocks_to_swap = 0
@@ -787,7 +790,9 @@ def _sample_image_inference(
             dit_secondary=dit_secondary,
         )
 
-    except torch.cuda.OutOfMemoryError as e:
+    except Exception as e:
+        if not is_oom_error(e):
+            raise
         if original_blocks_to_swap and original_blocks_to_swap > 0:
             logger.warning("OOM. Falling back to block swapping")
             clean_memory_on_device(accelerator.device)

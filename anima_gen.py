@@ -6,6 +6,7 @@ import torch
 import threading
 from accelerate import Accelerator
 from library import anima_utils, strategy_anima, anima_train_utils, train_util
+from library.device_utils import clean_memory_on_device
 from library.utils import setup_logging
 
 setup_logging()
@@ -46,7 +47,7 @@ def _apply_lora(accelerator, models, lora_path, multiplier):
         del net_sec
 
     del sd
-    torch.cuda.empty_cache()
+    clean_memory_on_device(accelerator.device)
 
 def manage_lora(accelerator, models, target_path, target_mul):
     global CURRENT_LORA
@@ -131,38 +132,47 @@ def load_models(args, accelerator):
         CURRENT_LORA["path"] = args.network_weights
         CURRENT_LORA["mul"] = args.network_mul
 
-    # Move to GPU (or distribute across GPUs)
+    # Move to accelerator (or distribute across multiple accelerators: CUDA GPUs / Ascend NPUs)
     dit_secondary = None
-    if args.device_map == 'parallel_cfg' and torch.cuda.device_count() > 1:
-        # Parallel CFG: full model on each GPU for simultaneous pos/neg inference
+    dev_type = accelerator.device.type  # "cuda" or "npu"
+    device_count = train_util.get_accelerator_device_count()
+    if args.device_map == 'parallel_cfg' and device_count > 1:
+        # Parallel CFG: full model on each device for simultaneous pos/neg inference
         import copy
-        logger.info("Parallel CFG mode: loading model on both GPUs")
-        dit.to(torch.device('cuda:0'))
-        logger.info("  Primary model on GPU 0")
-        
+        logger.info(f"Parallel CFG mode: loading model on both {dev_type} devices")
+        primary_device = torch.device(dev_type, 0)
+        secondary_device = torch.device(dev_type, 1)
+        dit.to(primary_device)
+        logger.info(f"  Primary model on {primary_device}")
+
         dit_secondary = copy.deepcopy(dit)
-        dit_secondary.to(torch.device('cuda:1'))
-        logger.info("  Secondary model (deepcopy) on GPU 1")
-        
-        qwen3_text_encoder.to(torch.device('cuda:0'))
-        vae.to(torch.device('cuda:0'))
-        vae_scale = [t.to(torch.device('cuda:0')) for t in vae_scale]
-    elif args.device_map == 'sharding' and torch.cuda.device_count() > 1:
-        # Multi-GPU model sharding: distribute DiT blocks across GPUs
-        num_gpus = torch.cuda.device_count()
-        logger.info(f"Multi-GPU sharding: distributing model across {num_gpus} GPUs")
-        
-        # Get VRAM for each GPU to split proportionally
+        dit_secondary.to(secondary_device)
+        logger.info(f"  Secondary model (deepcopy) on {secondary_device}")
+
+        qwen3_text_encoder.to(primary_device)
+        vae.to(primary_device)
+        vae_scale = [t.to(primary_device) for t in vae_scale]
+    elif args.device_map == 'sharding' and device_count > 1:
+        # Multi-device model sharding: distribute DiT blocks across devices
+        num_gpus = device_count
+        logger.info(f"Multi-device sharding: distributing model across {num_gpus} {dev_type} devices")
+
+        # Get device memory to split proportionally
         vram = []
         for i in range(num_gpus):
-            total_mem = torch.cuda.get_device_properties(i).total_memory
+            if dev_type == "npu":
+                name = torch.npu.get_device_name(i)
+                total_mem = torch.npu.get_device_properties(i).total_memory
+            else:
+                name = torch.cuda.get_device_name(i)
+                total_mem = torch.cuda.get_device_properties(i).total_memory
             vram.append(total_mem)
-            logger.info(f"  GPU {i}: {torch.cuda.get_device_properties(i).name} ({total_mem / 1e9:.1f} GB)")
-        
+            logger.info(f"  {dev_type} {i}: {name} ({total_mem / 1e9:.1f} GB)")
+
         total_vram = sum(vram)
         num_blocks = len(dit.blocks)
-        
-        # Split blocks proportionally by VRAM
+
+        # Split blocks proportionally by memory
         gpu_assignments = []
         blocks_assigned = 0
         for i in range(num_gpus):
@@ -172,12 +182,12 @@ def load_models(args, accelerator):
                 n = round(num_blocks * vram[i] / total_vram)
             gpu_assignments.append(n)
             blocks_assigned += n
-        
-        # Move components to their assigned GPUs
-        first_gpu = torch.device('cuda:0')
-        last_gpu = torch.device(f'cuda:{num_gpus - 1}')
-        
-        # Embeddings on first GPU, final layer on last GPU
+
+        # Move components to their assigned devices
+        first_gpu = torch.device(dev_type, 0)
+        last_gpu = torch.device(dev_type, num_gpus - 1)
+
+        # Embeddings on first device, final layer on last device
         dit.x_embedder.to(first_gpu)
         dit.t_embedder.to(first_gpu)
         dit.t_embedding_norm.to(first_gpu)
@@ -188,21 +198,21 @@ def load_models(args, accelerator):
         if hasattr(dit, 'llm_adapter'):
             dit.llm_adapter.to(first_gpu)
         dit.final_layer.to(last_gpu)
-        
-        # Distribute blocks across GPUs
+
+        # Distribute blocks across devices
         block_idx = 0
         for gpu_id in range(num_gpus):
-            device = torch.device(f'cuda:{gpu_id}')
+            device = torch.device(dev_type, gpu_id)
             n_blocks = gpu_assignments[gpu_id]
             for _ in range(n_blocks):
                 dit.blocks[block_idx].to(device)
                 block_idx += 1
-            logger.info(f"  GPU {gpu_id}: {n_blocks} blocks")
-        
+            logger.info(f"  {dev_type} {gpu_id}: {n_blocks} blocks")
+
         # Mark model as sharded so forward() knows to move tensors between devices
         dit._is_multi_gpu_sharded = True
 
-        # Text encoder on first GPU, VAE on last GPU
+        # Text encoder on first device, VAE on last device
         qwen3_text_encoder.to(first_gpu)
         vae.to(last_gpu)
         vae_scale = [t.to(last_gpu) for t in vae_scale]
@@ -347,7 +357,7 @@ def main():
     parser.add_argument("--sample_every_n_epochs", type=int, default=None)
     parser.add_argument("--network_weights", type=str, default=None, help="Path to LoRA weights")
     parser.add_argument("--network_mul", type=float, default=1.0, help="LoRA multiplier")
-    parser.add_argument("--device_map", type=str, default=None, help="Device map for model sharding (sharding = split across GPUs)")
+    parser.add_argument("--device_map", type=str, default=None, help="Device map for model sharding (sharding/parallel_cfg = split across CUDA GPUs or Ascend NPUs)")
     
     parser.add_argument("--sage_attn", action="store_true", help="Use SageAttention for inference (requires sageattention package)")
     parser.add_argument("--server_port", type=int, default=None, help="Run in server mode on this port")
@@ -371,6 +381,9 @@ def main():
                 # Windows: use gloo and disable libuv for better stability
                 os.environ["USE_LIBUV"] = "0"
                 backend = "gloo"
+            elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+                # Ascend NPU: use HCCL
+                backend = "hccl"
             else:
                 # Linux: use nccl for better performance
                 backend = "nccl"

@@ -31,6 +31,17 @@ const ARCHITECTURES_PATH = path.join(__dirname, 'architectures.json');
 // Load architecture registry
 const ARCH_REGISTRY = JSON.parse(fs.readFileSync(ARCHITECTURES_PATH, 'utf8'));
 
+// Detect Ascend NPU once at startup (Linux + npu-smi available)
+const HAS_NPU = (() => {
+    if (process.platform === 'win32') return false;
+    try {
+        execFileSync('npu-smi', ['info'], { stdio: 'ignore', timeout: 4000 });
+        return true;
+    } catch (_) {
+        return false;
+    }
+})();
+
 // Resolve architecture from a job config's network_module
 function getArchForJob(jobConfig) {
     const netModule = jobConfig?.network_arguments?.network_module || '';
@@ -160,9 +171,29 @@ app.get('/api/gpu/activity', (req, res) => {
     res.json(activity);
 });
 
-// Get GPU Information using nvidia-smi with Python fallback
+// Get accelerator (GPU/NPU) information. NPU is enumerated via npu-smi (or torch fallback),
+// NVIDIA GPUs via nvidia-smi with a Python/torch fallback.
 async function getDetectedGPUs() {
     return new Promise((resolve) => {
+        // Ascend NPU: parse npu-smi directly, fall back to the venv's torch_npu
+        if (HAS_NPU) {
+            try {
+                const out = execFileSync('npu-smi', ['info'], { timeout: 4000 }).toString();
+                const { parseNpuSmi } = require('./lib/hardware');
+                const stats = parseNpuSmi(out);
+                if (stats && stats.length) {
+                    return resolve(stats.map(s => ({
+                        index: s.index,
+                        name: s.name,
+                        memory: `${s.memTotal} MiB`
+                    })));
+                }
+            } catch (e) {
+                console.warn('npu-smi parsing failed, trying python fallback...');
+            }
+            return detectAcceleratorsViaPython(resolve);
+        }
+
         // 1. Try nvidia-smi
         const smi = spawn('nvidia-smi', ['--query-gpu=index,name,memory.total', '--format=csv,noheader']);
         let stdout = '';
@@ -185,49 +216,67 @@ async function getDetectedGPUs() {
                 return resolve(gpus);
             }
 
-            // 2. Fallback to Python (torch)
-            console.warn("nvidia-smi failed, trying python fallback...");
-            const globalConfig = getGlobalConfig();
-            const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
-            let pythonPath = 'python'; // Default
-            if (process.platform === 'win32') {
-                pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
-            } else {
-                pythonPath = path.join(venvPath, 'bin', 'python');
-            }
-
-            if (!fs.existsSync(pythonPath)) {
-                pythonPath = 'python';
-            }
-
-            const pyScript = "import torch; import json; print(json.dumps([{'index': i, 'name': torch.cuda.get_device_name(i), 'memory': f'{torch.cuda.get_device_properties(i).total_memory // 1024**2} MiB'} for i in range(torch.cuda.device_count())]))";
-
-            const pyProc = spawn(pythonPath, ['-c', pyScript]);
-            let pyOut = '';
-            let pyErr = '';
-
-            pyProc.stdout.on('data', (data) => pyOut += data);
-            pyProc.stderr.on('data', (data) => pyErr += data);
-
-            pyProc.on('close', (pyCode) => {
-                if (pyCode !== 0) {
-                    console.error("Python GPU detection failed:", pyErr);
-                    return resolve([]);
-                }
-                try {
-                    const gpus = JSON.parse(pyOut.trim());
-                    resolve(gpus);
-                } catch (e) {
-                    console.error("Failed to parse Python GPU output:", e);
-                    resolve([]);
-                }
-            });
+            // 2. Fallback to Python (torch / torch_npu)
+            detectAcceleratorsViaPython(resolve);
         });
 
         smi.on('error', (err) => {
-            // Silently fail to fallback
+            detectAcceleratorsViaPython(resolve);
         });
     });
+}
+
+function detectAcceleratorsViaPython(resolve) {
+    console.warn("nvidia-smi failed, trying python fallback...");
+    const globalConfig = getGlobalConfig();
+    const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
+    let pythonPath = 'python'; // Default
+    if (process.platform === 'win32') {
+        pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
+    } else {
+        pythonPath = path.join(venvPath, 'bin', 'python');
+    }
+
+    if (!fs.existsSync(pythonPath)) {
+        pythonPath = 'python';
+    }
+
+    const pyScript = [
+        "import json",
+        "try:",
+        "    import torch_npu",
+        "except Exception:",
+        "    pass",
+        "import torch",
+        "def _devs():",
+        "    if hasattr(torch, 'npu') and torch.npu.is_available():",
+        "        return [{'index': i, 'name': torch.npu.get_device_name(i), 'memory': f'{torch.npu.get_device_properties(i).total_memory // 1024**2} MiB'} for i in range(torch.npu.device_count())]",
+        "    return [{'index': i, 'name': torch.cuda.get_device_name(i), 'memory': f'{torch.cuda.get_device_properties(i).total_memory // 1024**2} MiB'} for i in range(torch.cuda.device_count())]",
+        "print(json.dumps(_devs()))",
+    ].join('\n');
+
+    const pyProc = spawn(pythonPath, ['-c', pyScript]);
+    let pyOut = '';
+    let pyErr = '';
+
+    pyProc.stdout.on('data', (data) => pyOut += data);
+    pyProc.stderr.on('data', (data) => pyErr += data);
+
+    pyProc.on('close', (pyCode) => {
+        if (pyCode !== 0) {
+            console.error("Python accelerator detection failed:", pyErr);
+            return resolve([]);
+        }
+        try {
+            const gpus = JSON.parse(pyOut.trim());
+            resolve(gpus);
+        } catch (e) {
+            console.error("Failed to parse Python accelerator output:", e);
+            resolve([]);
+        }
+    });
+
+    pyProc.on('error', () => resolve([]));
 }
 
 function getDefaultConfig() {
@@ -972,7 +1021,7 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
         if (validIds.some(id => isNaN(parseInt(id))))
             return { error: 'GPU IDs must be valid numbers.' };
 
-        gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', validIds.join(','));
+        gpuEnv = buildEnvVar(HAS_NPU ? 'ASCEND_RT_VISIBLE_DEVICES' : 'CUDA_VISIBLE_DEVICES', validIds.join(','));
 
         if (validIds.length > 1) {
             if (mode === 'tp_sp') {
@@ -986,10 +1035,10 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                 }
                 const n = validIds.length;
                 const target = path.join(ROOT_DIR, tpScript);
-                // Validate tp_backend against whitelist
-                const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
-                const rawBackend = ta.tp_backend || (isWindows ? 'gloo' : 'nccl');
-                const tpBackend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
+                // Validate tp_backend against whitelist (HCCL on Ascend NPU)
+                const allowedBackends = HAS_NPU ? ['hccl', 'gloo'] : ['nccl', 'cuda_direct', 'gloo', 'mpi'];
+                const rawBackend = ta.tp_backend || (HAS_NPU ? 'hccl' : (isWindows ? 'gloo' : 'nccl'));
+                const tpBackend = allowedBackends.includes(rawBackend) ? rawBackend : (HAS_NPU ? 'hccl' : (isWindows ? 'gloo' : 'nccl'));
                 tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n} --tp_backend ${tpBackend} --sequence_parallel --config_file="${mergedConfigPath}"`;
 
             } else if (mode === 'fsdp2') {
@@ -1061,7 +1110,7 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
         }
     }
 
-    if (ta.torch_compile && mode !== 'tp_sp' && mode !== 'fsdp2')
+    if (ta.torch_compile && !HAS_NPU && mode !== 'tp_sp' && mode !== 'fsdp2')
         accelerateFlags += ' --dynamo_backend inductor';
 
     return { gpuEnv, accelerateFlags, tpTrainCmd };
@@ -1489,10 +1538,10 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             let tp = Number(mergedConfig.training_arguments.tp_degree || 2);
             if (!Number.isFinite(tp)) tp = 2;
             mergedConfig.training_arguments.tp_degree = Math.max(2, tp);
-            // Validate tp_backend against whitelist
-            const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
-            const rawBackend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'gloo' : 'nccl');
-            mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
+            // Validate tp_backend against whitelist (HCCL on Ascend NPU)
+            const allowedBackends = HAS_NPU ? ['hccl', 'gloo'] : ['nccl', 'cuda_direct', 'gloo', 'mpi'];
+            const rawBackend = mergedConfig.training_arguments.tp_backend || (HAS_NPU ? 'hccl' : (isWindows ? 'gloo' : 'nccl'));
+            mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (HAS_NPU ? 'hccl' : (isWindows ? 'gloo' : 'nccl'));
             delete mergedConfig.training_arguments.use_cuda_direct;
             delete mergedConfig.training_arguments.save_state;
             delete mergedConfig.training_arguments.save_state_on_train_end;
@@ -1597,6 +1646,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             buildEnvVar('TOKENIZERS_PARALLELISM', 'false'),
             buildEnvVar('MALLOC_ARENA_MAX', '2'),
             gpuEnv,
+            HAS_NPU ? buildEnvVar('HCCL_CONNECT_TIMEOUT', '120') : '',
             mergedConfig.training_arguments?.step_profile ? buildEnvVar('STEP_PROFILE', '1') : '',
             mergedConfig.training_arguments?.profile_microbatch ? buildEnvVar('PROFILE_MICROBATCH', '1') : '',
             (isWindows && isMultiGpu) ? buildEnvVar('USE_LIBUV', '0') : '',
@@ -1638,9 +1688,8 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
 
         proc.on('close', (code) => {
             const msg = `\n--- Training ${code === 0 ? 'completed' : 'stopped'} (exit code: ${code}) ---\n`;
-            logStream.write(msg);
-            logStream.end();
             appendLog(Buffer.from(msg));
+            logStream.end();
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
         });

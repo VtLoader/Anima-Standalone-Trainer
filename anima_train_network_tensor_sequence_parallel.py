@@ -149,6 +149,9 @@ def fuse_qkv_for_tp_lora(model: torch.nn.Module, *, include_llm_adapter: bool = 
             cos, sin = position_embeddings_context
             key_states = _adapter_apply_rotary_pos_emb(key_states, cos, sin)
 
+        from library.anima_models import expand_attention_mask_for_npu
+        mask = expand_attention_mask_for_npu(mask, query_states)
+
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_output)
@@ -760,6 +763,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             mem = ""
             if torch.cuda.is_available() and torch.cuda.current_device() >= 0:
                 mem = f" cuda_mem_alloc_mb={torch.cuda.memory_allocated() / (1024 ** 2):.1f}"
+            elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+                mem = f" npu_mem_alloc_mb={torch.npu.memory_allocated() / (1024 ** 2):.1f}"
             if self._tp_debug_should_sample(self._tp_step):
                 self._tp_diag(args, f"step={self._tp_step} loss={loss_val:.8g} finite={finite_loss} latent_shape={lat_shape}{mem}", all_ranks=True)
             if self._tp_rank() == 0 and not finite_loss:
@@ -1039,6 +1044,12 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         # Save RNG state
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        npu_rng_state = None
+        if cuda_rng_state is None and getattr(torch, "npu", None) is not None and torch.npu.is_available():
+            try:
+                npu_rng_state = torch.npu.get_rng_state()
+            except Exception:
+                npu_rng_state = None
 
         org_vae_device = next(vae.parameters()).device
         vae.to(accelerator.device)
@@ -1077,6 +1088,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
+            elif npu_rng_state is not None:
+                torch.npu.set_rng_state(npu_rng_state)
 
         if dist.is_initialized():
             dist.barrier()
@@ -1127,8 +1140,8 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Tensor Parallel degree. Must match --nproc_per_node in torchrun. (default: 2)",
     )
     parser.add_argument(
-        "--tp_backend", type=str, default="auto", choices=["auto", "gloo", "cuda_direct", "nccl"],
-        help="Distributed backend for TP+SP. Use cuda_direct on native Windows, nccl on WSL/Linux.",
+        "--tp_backend", type=str, default="auto", choices=["auto", "gloo", "cuda_direct", "nccl", "hccl"],
+        help="Distributed backend for TP+SP. Use cuda_direct on native Windows, nccl on WSL/Linux, hccl on Ascend NPU.",
     )
     parser.add_argument(
         "--sequence_parallel", action="store_true", default=True,
@@ -1204,7 +1217,10 @@ if __name__ == "__main__":
     tp_backend = wdp.activate_backend(getattr(args, "tp_backend", "auto"))
     dist.init_process_group(backend=tp_backend)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+        torch.npu.set_device(local_rank)
     world_size = dist.get_world_size()
     if world_size != tp_degree:
         raise ValueError(f"tp_degree={tp_degree} must match torchrun world_size={world_size}")

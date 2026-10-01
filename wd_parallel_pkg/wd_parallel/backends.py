@@ -34,10 +34,26 @@ def _cuda_available() -> bool:
         return False
 
 
+def _npu_available() -> bool:
+    try:
+        import torch
+        return getattr(torch, "npu", None) is not None and torch.npu.is_available()
+    except Exception:
+        return False
+
+
 def _nccl_available() -> bool:
     try:
         import torch.distributed as dist
         return dist.is_nccl_available()
+    except Exception:
+        return False
+
+
+def _hccl_available() -> bool:
+    try:
+        import torch.distributed as dist
+        return dist.is_hccl_available()
     except Exception:
         return False
 
@@ -57,11 +73,12 @@ def activate_backend(backend: str) -> str:
     Activate and return an explicitly requested distributed backend.
 
     Args:
-        backend: "auto"        - use NCCL when available on non-Windows CUDA,
-                                 otherwise use Gloo
+        backend: "auto"        - use HCCL on Ascend NPU, else NCCL when available on
+                                 non-Windows CUDA, otherwise use Gloo
                  "cuda_direct" - force cuda_direct (Windows SHM zero-copy)
                  "gloo"        - force gloo (TCP, cross-platform fallback)
                  "nccl"        - force NCCL (Linux/GPU clusters)
+                 "hccl"        - force HCCL (Ascend NPU)
 
     Returns:
         The resolved backend name to pass to dist.init_process_group().
@@ -80,10 +97,10 @@ def activate_backend(backend: str) -> str:
             "activate_backend() requires an explicit backend. "
             "Skip this call to let the training script / PyTorch choose."
         )
-    if backend not in {"auto", "cuda_direct", "gloo", "nccl"}:
+    if backend not in {"auto", "cuda_direct", "gloo", "nccl", "hccl"}:
         raise ValueError(
             f"Unsupported backend {backend!r}. "
-            "Expected one of: auto, cuda_direct, gloo, nccl."
+            "Expected one of: auto, cuda_direct, gloo, nccl, hccl."
         )
 
     if os.name == "nt":
@@ -92,6 +109,8 @@ def activate_backend(backend: str) -> str:
         os.environ.setdefault("USE_LIBUV", "0")
         if backend == "nccl":
             raise ValueError("NCCL is not supported on Windows. Use gloo.")
+        if backend == "hccl":
+            raise ValueError("HCCL is not supported on Windows. Use gloo.")
 
     if backend == "cuda_direct":
         if os.name != "nt":
@@ -102,6 +121,8 @@ def activate_backend(backend: str) -> str:
     if backend != "auto":
         return backend
 
+    if _npu_available() and _hccl_available():
+        return "hccl"
     if os.name != "nt" and _cuda_available() and _nccl_available():
         return "nccl"
     return "gloo"

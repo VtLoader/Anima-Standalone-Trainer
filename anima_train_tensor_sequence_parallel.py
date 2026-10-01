@@ -342,6 +342,9 @@ def fuse_qkv_for_tp(model: torch.nn.Module, *, include_llm_adapter: bool = True)
             cos, sin = position_embeddings_context
             key_states   = _adapter_apply_rotary_pos_emb(key_states, cos, sin)
 
+        from library.anima_models import expand_attention_mask_for_npu
+        mask = expand_attention_mask_for_npu(mask, query_states)
+
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_output)
@@ -933,8 +936,8 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tp_backend", type=str, default="auto",
-        choices=["auto", "gloo", "cuda_direct", "nccl"],
-        help="Distributed backend for TP. Use cuda_direct on Windows, nccl on WSL/Linux.",
+        choices=["auto", "gloo", "cuda_direct", "nccl", "hccl"],
+        help="Distributed backend for TP. Use cuda_direct on Windows, nccl on WSL/Linux, hccl on Ascend NPU.",
     )
     parser.add_argument(
         "--sequence_parallel", action="store_true", default=False,
@@ -1011,7 +1014,10 @@ if __name__ == "__main__":
     tp_backend = wdp.activate_backend(getattr(args, "tp_backend", "auto"))
     dist.init_process_group(backend=tp_backend)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+        torch.npu.set_device(local_rank)
     world_size = dist.get_world_size()
     if world_size != tp_degree:
         raise ValueError(

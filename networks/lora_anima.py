@@ -26,6 +26,20 @@ from networks.lora_flux import LoRAModule, LoRAInfModule
 # Lazy-import flag — set True once wd_parallel is confirmed importable.
 _WDP_AVAILABLE: Optional[bool] = None
 
+def _to_collective_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a tensor to the accelerator device required by the TP backend.
+
+    NCCL needs CUDA tensors and HCCL needs NPU tensors; Gloo accepts CPU tensors.
+    """
+    if tensor.device.type in ("cuda", "npu"):
+        return tensor
+    if torch.cuda.is_available():
+        return tensor.cuda()
+    if getattr(torch, "npu", None) is not None and torch.npu.is_available():
+        return tensor.npu()
+    return tensor
+
+
 
 def _try_import_wdp():
     global _WDP_AVAILABLE
@@ -1164,7 +1178,7 @@ class LoRANetwork(torch.nn.Module):
                 for up in lora.lora_up:
                     w = up.weight.data
                     orig_device = w.device
-                    w_c = w.contiguous().cuda()
+                    w_c = _to_collective_device(w.contiguous())
                     gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
                     dist.all_gather(gathered, w_c, group=lora._tp_group)
                     full = torch.cat(gathered, dim=0).to(orig_device)
@@ -1178,7 +1192,7 @@ class LoRANetwork(torch.nn.Module):
                 orig_device = w.device
                 # cuda_direct requires CUDA tensors; weights may be on CPU before
                 # the network moves to GPU (e.g. during verify checks).
-                w_c = w.contiguous().cuda()
+                w_c = _to_collective_device(w.contiguous())
                 gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
                 dist.all_gather(gathered, w_c, group=lora._tp_group)
                 full = torch.cat(gathered, dim=0).to(orig_device)
@@ -1191,7 +1205,7 @@ class LoRANetwork(torch.nn.Module):
                 # lora_down.weight: (lora_dim, in_features/tp) → gather dim 1
                 w = lora.lora_down.weight.data
                 orig_device = w.device
-                w_c = w.contiguous().cuda()
+                w_c = _to_collective_device(w.contiguous())
                 gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
                 dist.all_gather(gathered, w_c, group=lora._tp_group)
                 full = torch.cat(gathered, dim=1).to(orig_device)
@@ -1254,6 +1268,19 @@ class LoRANetwork(torch.nn.Module):
                 v = state_dict[key]
                 v = v.detach().clone().to("cpu").to(dtype)
                 state_dict[key] = v
+        else:
+            # TP-packed modules can share storage between q/k/v alpha tensors; safetensors
+            # refuses to serialize tensors that share memory, so clone duplicates.
+            seen_ptrs = set()
+            for key in list(state_dict.keys()):
+                v = state_dict[key]
+                if not torch.is_tensor(v):
+                    continue
+                ptr = v.data_ptr()
+                if ptr in seen_ptrs:
+                    state_dict[key] = v.detach().clone()
+                else:
+                    seen_ptrs.add(ptr)
 
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file

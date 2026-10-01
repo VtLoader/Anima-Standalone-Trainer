@@ -26,8 +26,9 @@ class StepProfiler:
         self._t3 = None  # end of comm
 
         self._peak_vram = 0  # peak real VRAM 
+        self._is_npu = getattr(accelerator.device, "type", "") == "npu"
         self._nvml_handle = None
-        if enabled and _NVML_AVAILABLE:
+        if enabled and _NVML_AVAILABLE and not self._is_npu:
             try:
                 pynvml.nvmlInit()
                 local_index = accelerator.device.index or 0
@@ -85,6 +86,12 @@ class StepProfiler:
             except Exception:
                 pass
 
+    def _sync(self):
+        if self._is_npu:
+            torch.npu.synchronize()
+        else:
+            torch.cuda.synchronize()
+
     def _nvml_poll(self):
         if self._nvml_handle is None:
             return
@@ -93,6 +100,15 @@ class StepProfiler:
             self._peak_vram = max(self._peak_vram, used)
         except Exception:
             pass
+
+    def _poll_memory(self):
+        if self._is_npu:
+            try:
+                self._peak_vram = max(self._peak_vram, torch.npu.max_memory_allocated())
+            except Exception:
+                pass
+            return
+        self._nvml_poll()
 
     def request_snapshot(self, step: int):
         """Schedule a full memory snapshot for the given global step.
@@ -108,37 +124,37 @@ class StepProfiler:
 
     def on_batch_start(self):
         if not self.enabled: return
-        torch.cuda.synchronize()
+        self._sync()
         now = time.perf_counter()
         if self._t0_step is None:
             self._t0_step = now
             self._mb_index = 0
             self._mb_lines = []
-            if self._snapshot_step is not None:
+            if self._snapshot_step is not None and not self._is_npu:
                 torch.cuda.memory._record_memory_history(max_entries=100_000)
         self._t0 = now
         self._mb_index += 1
-        self._nvml_poll()
+        self._poll_memory()
         if self._comm_timer is not None:
             self._comm_timer.set_context("fwd")
 
     def on_fwd_done(self):
         if not self.enabled: return
-        torch.cuda.synchronize()
+        self._sync()
         self._t1 = time.perf_counter()
         self._cum_fwd += (self._t1 - self._t0) * 1000
-        self._nvml_poll()
+        self._poll_memory()
         if self._comm_timer is not None:
             self._comm_timer.set_context("bwd")
 
     def on_bwd_done(self):
         if not self.enabled: return
-        torch.cuda.synchronize()
+        self._sync()
         self._t2 = time.perf_counter()
         self._cum_bwd += (self._t2 - self._t1) * 1000
         # Default t3 to t2 so that if on_comm_done isn't called, comm time is 0
         self._t3 = self._t2
-        self._nvml_poll()
+        self._poll_memory()
         if self._comm_timer is not None:
             self._comm_timer.set_context("comm")
 
@@ -151,11 +167,11 @@ class StepProfiler:
 
     def on_comm_done(self):
         if not self.enabled: return
-        torch.cuda.synchronize()
+        self._sync()
         now = time.perf_counter()
         self._cum_comm += (now - self._t2) * 1000  # accumulate, since this fires every micro-batch, not just the last
         self._t3 = now
-        self._nvml_poll()
+        self._poll_memory()
 
     def on_step_done(self, global_step):
         if not self.enabled: return
@@ -163,19 +179,22 @@ class StepProfiler:
         # Only print summary when accumulation is complete
         if not self.accelerator.sync_gradients: return
 
-        torch.cuda.synchronize()
+        self._sync()
         t4 = time.perf_counter()
-        self._nvml_poll()
+        self._poll_memory()
 
         # Dump snapshot if this was the requested step
         if self._snapshot_step is not None:
-            fname = f"memory_snapshot_step{global_step + 1}.pickle"
-            try:
-                torch.cuda.memory._dump_snapshot(fname)
-                tqdm.write(f"[PROFILE] memory snapshot saved → {fname}  (load at pytorch.org/memory_viz)")
-            except Exception as e:
-                tqdm.write(f"[PROFILE] memory snapshot failed: {e}")
-            torch.cuda.memory._record_memory_history(enabled=None)
+            if self._is_npu:
+                tqdm.write("[PROFILE] memory snapshot is not supported on NPU; skipped")
+            else:
+                fname = f"memory_snapshot_step{global_step + 1}.pickle"
+                try:
+                    torch.cuda.memory._dump_snapshot(fname)
+                    tqdm.write(f"[PROFILE] memory snapshot saved → {fname}  (load at pytorch.org/memory_viz)")
+                except Exception as e:
+                    tqdm.write(f"[PROFILE] memory snapshot failed: {e}")
+                torch.cuda.memory._record_memory_history(enabled=None)
             self._snapshot_step = None
 
         ms_comm = self._cum_comm  # accumulated across all micro-batches, not just the last

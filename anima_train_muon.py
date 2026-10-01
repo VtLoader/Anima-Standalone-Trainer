@@ -769,6 +769,7 @@ class MuonAnimaTrainer:
             )
         else:
             if train_dit:
+                dit = train_util.apply_npu_torch_compile(args, dit, label="DiT")
                 dit = self.prepare_dit_with_accelerator(accelerator, dit, is_swapping_blocks)
             optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 

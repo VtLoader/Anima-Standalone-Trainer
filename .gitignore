@@ -48,6 +48,15 @@ training-ui/public/uploads/
 training-ui/global_config.toml
 training-ui/_merged_config.toml
 
+# Local machine-specific launcher (NPU)
+start_npu_training.sh
+
+# Local training datasets (user data, not for git)
+dataset/
+
+# Ascend op compile cache created at runtime
+kernel_meta/
+
 # OS
 .DS_Store
 Thumbs.db

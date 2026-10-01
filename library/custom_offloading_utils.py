@@ -17,6 +17,18 @@ except (ImportError, AttributeError):
             return fn
 
 
+# Offloading frees/refills each weight's accelerator storage in place
+_ACCELERATOR_TYPES = ("cuda", "npu")
+
+
+def _is_accel_device(device: torch.device) -> bool:
+    return device.type in _ACCELERATOR_TYPES
+
+
+def _get_stream_module(device: torch.device):
+    return torch.cuda if device.type == "cuda" else torch.npu
+
+
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
 def _clean_memory_on_device(device: torch.device):
     r"""
@@ -27,6 +39,8 @@ def _clean_memory_on_device(device: torch.device):
     # device may "cuda" or "cuda:0", so we need to check the type of device
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    if device.type == "npu":
+        torch.npu.empty_cache()
     if device.type == "xpu":
         torch.xpu.empty_cache()
     if device.type == "mps":
@@ -36,6 +50,8 @@ def _clean_memory_on_device(device: torch.device):
 def _synchronize_device(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "npu":
+        torch.npu.synchronize()
     elif device.type == "xpu":
         torch.xpu.synchronize()
     elif device.type == "mps":
@@ -73,7 +89,7 @@ def _offload_weights(layer: nn.Module, non_blocking: bool) -> list:
     # copy weights to CPU buffers; caller frees storages after the copies complete
     offloaded = []
     for weight in _weight_params(layer):
-        if weight.device.type != "cuda" or weight.data.untyped_storage().nbytes() == 0:
+        if not _is_accel_device(weight.device) or weight.data.untyped_storage().nbytes() == 0:
             continue
         buf, pinned = _cpu_buffer_for(weight)
         copy_non_blocking = non_blocking and pinned
@@ -92,7 +108,7 @@ def _free_weights(weights: list):
 
 def _load_weights(layer: nn.Module, non_blocking: bool):
     for weight in _weight_params(layer):
-        if weight.device.type != "cuda":
+        if not _is_accel_device(weight.device):
             continue
         storage = weight.data.untyped_storage()
         if storage.nbytes() != 0:
@@ -111,7 +127,7 @@ def materialize_optimizer_params(optimizer) -> int:
     n = 0
     for group in optimizer.param_groups:
         for p in group["params"]:
-            if p is None or p.grad is None or p.device.type != "cuda":
+            if p is None or p.grad is None or not _is_accel_device(p.device):
                 continue
             storage = p.data.untyped_storage()
             if storage.nbytes() == 0:
@@ -125,9 +141,9 @@ def materialize_optimizer_params(optimizer) -> int:
 
 
 def _state_dict_materialize_hook(module: nn.Module, state_dict, prefix, local_metadata):
-    # offloaded weights have empty GPU storage; substitute their CPU buffer contents
+    # offloaded weights have empty accelerator storage; substitute their CPU buffer contents
     for name, p in module.named_parameters():
-        if p.device.type == "cuda" and p.data.untyped_storage().nbytes() == 0:
+        if _is_accel_device(p.device) and p.data.untyped_storage().nbytes() == 0:
             buf = _param_cpu_buffers.get(id(p))
             key = prefix + name
             if buf is not None and key in state_dict:
@@ -140,7 +156,7 @@ def _load_state_dict_materialize_pre_hook(
 ):
     # re-allocate empty storages so load_state_dict can copy into them
     for _, p in module.named_parameters():
-        if p.device.type == "cuda":
+        if _is_accel_device(p.device):
             storage = p.data.untyped_storage()
             if storage.nbytes() == 0:
                 storage.resize_(p.numel() * p.element_size())
@@ -162,22 +178,24 @@ def swap_weight_devices_cuda(
     stream_out: Optional[torch.Stream] = None,
     stream_in: Optional[torch.Stream] = None,
 ):
+    """Swap weights between the accelerator (CUDA or NPU) and CPU using dedicated streams."""
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+    stream_module = _get_stream_module(device)
 
-    torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
+    stream_module.current_stream().synchronize()  # this prevents the illegal loss value
 
-    stream_out = stream_out or torch.Stream(device="cuda")  # reuse caller's streams to avoid per-call stream creation
-    stream_in = stream_in or torch.Stream(device="cuda")
-    with torch.cuda.stream(stream_out):
+    stream_out = stream_out or torch.Stream(device=device.type)  # reuse caller's streams to avoid per-call stream creation
+    stream_in = stream_in or torch.Stream(device=device.type)
+    with stream_module.stream(stream_out):
         offloaded = _offload_weights(layer_to_cpu, non_blocking=True)
-    with torch.cuda.stream(stream_in):
+    with stream_module.stream(stream_in):
         _load_weights(layer_to_cuda, non_blocking=True)  # allocates before layer_to_cpu is freed, needs +1 block headroom
 
     stream_out.synchronize()  # D2H must land before its storage is freed
     _free_weights(offloaded)
     stream_in.synchronize()
 
-    torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
+    stream_module.current_stream().synchronize()  # this prevents the illegal loss value
 
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
@@ -206,7 +224,7 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
-    if device.type == "cuda":
+    if _is_accel_device(device):
         _load_weights(layer, non_blocking=False)
     else:
         offloaded = _offload_weights(layer, non_blocking=False)
@@ -226,10 +244,10 @@ class Offloader:
 
         self.thread_pool = ThreadPoolExecutor(max_workers=1)
         self.futures = {}
-        self.cuda_available = device.type == "cuda"
+        self.cuda_available = _is_accel_device(device)
         # created once and reused across swaps, avoids a stream-create call on every block swap
-        self._swap_stream_out = torch.Stream(device="cuda") if self.cuda_available else None
-        self._swap_stream_in = torch.Stream(device="cuda") if self.cuda_available else None
+        self._swap_stream_out = torch.Stream(device=device.type) if self.cuda_available else None
+        self._swap_stream_in = torch.Stream(device=device.type) if self.cuda_available else None
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:

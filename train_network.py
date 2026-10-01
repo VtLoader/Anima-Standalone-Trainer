@@ -488,6 +488,7 @@ class NetworkTrainer:
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
+        unet = train_util.apply_npu_torch_compile(args, unet, label="DiT")
         return accelerator.prepare(unet)
 
     def pre_step_calculation_setup(self, args, accelerator, train_dataloader):

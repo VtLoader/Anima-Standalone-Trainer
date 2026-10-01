@@ -31,6 +31,15 @@ def _rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
+def _accel_device() -> torch.device:
+    """Current accelerator device (CUDA GPU or Ascend NPU); device index aware."""
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if getattr(torch, "npu", None) is not None and torch.npu.is_available():
+        return torch.device("npu", torch.npu.current_device())
+    return torch.device("cpu")
+
+
 def _ok(name: str, passed: bool, detail: str = ""):
     tag = "PASS" if passed else "FAIL"
     msg = f"  [tp_verify] {tag}  {name}"
@@ -72,14 +81,14 @@ def check_collectives(groups) -> bool:
     all_passed = True
 
     # --- 1a: gather round-trip ---
-    full  = torch.arange(tp * S * D, dtype=torch.float32, device='cuda').reshape(tp * S, D)
+    full  = torch.arange(tp * S * D, dtype=torch.float32, device=_accel_device()).reshape(tp * S, D)
     shard = full[rank * S:(rank + 1) * S].clone()
     gathered = gather_from_sp_region(shard, group, seq_dim=0)
     ok, d = _allclose(gathered, full)
     all_passed &= _ok("gather round-trip (seq_dim=0)", ok, d)
 
     # --- 1b: gather seq_dim=1 (batch-first, Anima layout) ---
-    full2  = torch.arange(B * tp * S * D, dtype=torch.float32, device='cuda').reshape(B, tp * S, D)
+    full2  = torch.arange(B * tp * S * D, dtype=torch.float32, device=_accel_device()).reshape(B, tp * S, D)
     shard2 = full2[:, rank * S:(rank + 1) * S, :].contiguous()
     gathered2 = gather_from_sp_region(shard2, group, seq_dim=1)
     ok2, d2 = _allclose(gathered2, full2)
@@ -87,23 +96,23 @@ def check_collectives(groups) -> bool:
 
     # --- 1c: reduce-scatter correctness ---
     # Each rank contributes a constant (rank+1); reduce-scatter should sum them
-    const    = torch.full((tp * S, D), float(rank + 1), device='cuda')
+    const    = torch.full((tp * S, D), float(rank + 1), device=_accel_device())
     expected_sum = sum(r + 1 for r in range(tp))
-    expected_shard = torch.full((S, D), float(expected_sum), device='cuda')
+    expected_shard = torch.full((S, D), float(expected_sum), device=_accel_device())
     scattered = reduce_scatter_to_sp_region(const, group, seq_dim=0)
     ok3, d3 = _allclose(scattered, expected_shard)
     all_passed &= _ok("reduce-scatter sum correctness", ok3, d3)
 
     # --- 1d: copy_to_tp backward (all-reduce gradient) ---
-    # Use nn.Parameter as leaf anchor — torch.ones(...).cuda() is non-leaf in PyTorch 2.7+
-    # because .cuda() is a tracked ToCopyBackward op.
-    w = nn.Parameter(torch.ones(D, device='cuda', dtype=torch.float32))
+    # Use nn.Parameter as leaf anchor — torch.ones(...).to(_accel_device()) is non-leaf in PyTorch 2.7+
+    # because .to(_accel_device()) is a tracked ToCopyBackward op.
+    w = nn.Parameter(torch.ones(D, device=_accel_device(), dtype=torch.float32))
     x = w * 1.0  # non-leaf intermediate
     y = copy_to_tp_region(x, group)
     loss = (y * float(rank + 1)).sum()
     loss.backward()
     expected_grad = float(sum(r + 1 for r in range(tp)))
-    ok4, d4 = _allclose(w.grad, torch.full((D,), expected_grad, device='cuda'))
+    ok4, d4 = _allclose(w.grad, torch.full((D,), expected_grad, device=_accel_device()))
     all_passed &= _ok("copy_to_tp_region backward (all-reduce grad)", ok4, d4)
 
     return all_passed
@@ -131,14 +140,14 @@ def check_tp_layers(groups, use_sp: bool = False) -> bool:
 
     # Shared reference weights (broadcast from rank 0)
     torch.manual_seed(0)
-    W_col = torch.randn(D_mid, D_in, device='cuda', dtype=torch.float32)
-    W_row = torch.randn(D_out, D_mid, device='cuda', dtype=torch.float32)
+    W_col = torch.randn(D_mid, D_in, device=_accel_device(), dtype=torch.float32)
+    W_row = torch.randn(D_out, D_mid, device=_accel_device(), dtype=torch.float32)
     dist.broadcast(W_col, src=0, group=group)
     dist.broadcast(W_row, src=0, group=group)
 
     # Reference: single GPU linear chain (computed on all ranks with same weights+input)
     torch.manual_seed(1)
-    x_full = torch.randn(B, S, D_in, device='cuda', dtype=torch.float32)
+    x_full = torch.randn(B, S, D_in, device=_accel_device(), dtype=torch.float32)
     dist.broadcast(x_full, src=0, group=group)
     y_ref  = F.linear(F.gelu(F.linear(x_full, W_col)), W_row)   # (B, S, D_out)
 
@@ -149,13 +158,13 @@ def check_tp_layers(groups, use_sp: bool = False) -> bool:
                                sequence_parallel=use_sp, seq_dim=1)
     col.weight = nn.Parameter(W_col[rank*chunk_mid:(rank+1)*chunk_mid].contiguous())
     col._group = group
-    col.cuda()
+    col.to(_accel_device())
 
     row = RowParallelLinear(chunk_mid, D_out, bias=False,
                             sequence_parallel=use_sp, seq_dim=1)
     row.weight = nn.Parameter(W_row[:, rank*chunk_mid:(rank+1)*chunk_mid].contiguous())
     row._group = group
-    row.cuda()
+    row.to(_accel_device())
 
     # SP: each rank processes a shard of the sequence; Col gathers it internally
     Sl = S // tp
@@ -165,7 +174,7 @@ def check_tp_layers(groups, use_sp: bool = False) -> bool:
 
     if use_sp:
         # Gather shards to compare with full reference
-        parts = [torch.zeros(B, Sl, D_out, device='cuda', dtype=torch.float32) for _ in range(tp)]
+        parts = [torch.zeros(B, Sl, D_out, device=_accel_device(), dtype=torch.float32) for _ in range(tp)]
         dist.all_gather(parts, y_tp.float().contiguous(), group=group)
         y_tp_full = torch.cat(parts, dim=1)
     else:
@@ -177,12 +186,12 @@ def check_tp_layers(groups, use_sp: bool = False) -> bool:
 
     # --- Bias: verify bias is added exactly once (not tp_size times) ---
     torch.manual_seed(2)
-    W_bias  = torch.randn(D_out, D_in, device='cuda')
-    b_bias  = torch.randn(D_out, device='cuda')
+    W_bias  = torch.randn(D_out, D_in, device=_accel_device())
+    b_bias  = torch.randn(D_out, device=_accel_device())
     dist.broadcast(W_bias, src=0, group=group)
     dist.broadcast(b_bias, src=0, group=group)
 
-    x_b = torch.randn(B, 4, D_in, device='cuda')
+    x_b = torch.randn(B, 4, D_in, device=_accel_device())
     dist.broadcast(x_b, src=0, group=group)
     y_ref_bias = F.linear(x_b, W_bias, b_bias)
 
@@ -191,7 +200,7 @@ def check_tp_layers(groups, use_sp: bool = False) -> bool:
     row_b.weight = nn.Parameter(W_bias[:, rank*chunk_r:(rank+1)*chunk_r].contiguous())
     row_b.bias   = nn.Parameter(b_bias.clone())
     row_b._group = group
-    row_b.cuda()
+    row_b.to(_accel_device())
     x_shard_b = x_b[:, :, rank*chunk_r:(rank+1)*chunk_r].contiguous()
     y_tp_bias  = row_b(x_shard_b)
     ok_b, d_b = _allclose(y_tp_bias, y_ref_bias, atol=1e-3)
@@ -250,7 +259,7 @@ def check_model_forward(dit, groups, use_sp: bool = False) -> bool:
     # bit-identical without a broadcast. Only broadcast when on CUDA — the
     # cuda_direct backend rejects CPU tensors, and at this point in the training
     # script the model may still be on CPU (not yet moved to GPU).
-    if x_mock.is_cuda:
+    if x_mock.device.type in ("cuda", "npu"):
         dist.broadcast(x_mock,   src=0, group=group)
         dist.broadcast(t_mock,   src=0, group=group)
         dist.broadcast(ctx_mock, src=0, group=group)
@@ -405,10 +414,10 @@ def check_lora_forward_math(groups, use_sp: bool = False) -> bool:
 
     # Shared reference weights (broadcast from rank 0)
     torch.manual_seed(99)
-    W_base   = torch.randn(D, D, device='cuda', dtype=torch.float32)
-    W_down   = torch.randn(lora_dim, D, device='cuda', dtype=torch.float32)    # (lora_dim, D_in)
-    W_up_col = torch.randn(D, lora_dim, device='cuda', dtype=torch.float32)    # (D_out, lora_dim)
-    x_full   = torch.randn(B, S, D, device='cuda', dtype=torch.float32)
+    W_base   = torch.randn(D, D, device=_accel_device(), dtype=torch.float32)
+    W_down   = torch.randn(lora_dim, D, device=_accel_device(), dtype=torch.float32)    # (lora_dim, D_in)
+    W_up_col = torch.randn(D, lora_dim, device=_accel_device(), dtype=torch.float32)    # (D_out, lora_dim)
+    x_full   = torch.randn(B, S, D, device=_accel_device(), dtype=torch.float32)
     for t in [W_base, W_down, W_up_col, x_full]:
         dist.broadcast(t, src=0, group=group)
 
@@ -421,7 +430,7 @@ def check_lora_forward_math(groups, use_sp: bool = False) -> bool:
     col_base = ColumnParallelLinear(D, chunk, bias=False, sequence_parallel=use_sp, seq_dim=1)
     col_base.weight = nn.Parameter(W_base[rank*chunk:(rank+1)*chunk].clone())
     col_base._group = group
-    col_base.cuda()
+    col_base.to(_accel_device())
 
     col_lora = ColumnParallelLoRAModule(
         "test_col", col_base, 1.0, lora_dim, float(lora_dim),
@@ -429,7 +438,7 @@ def check_lora_forward_math(groups, use_sp: bool = False) -> bool:
     )
     col_lora.lora_down.weight = nn.Parameter(W_down.clone())
     col_lora.lora_up.weight   = nn.Parameter(W_up_col[rank*chunk:(rank+1)*chunk].clone())
-    col_lora.cuda()
+    col_lora.to(_accel_device())
     col_lora.apply_to()  # hooks col_base.forward → col_lora.forward
 
     x_col_input = x_full[:, rank*Sl:(rank+1)*Sl, :].contiguous() if use_sp else x_full
@@ -455,10 +464,10 @@ def check_lora_forward_math(groups, use_sp: bool = False) -> bool:
     #     = lora_up(W_down_full @ x_full)   + base(x_full)   [W_down_full = cat(W_down_r, dim=1)]
 
     torch.manual_seed(77)
-    W_base_row = torch.randn(D, D, device='cuda', dtype=torch.float32)
-    W_down_row = torch.randn(lora_dim, D, device='cuda', dtype=torch.float32)  # full
-    W_up_row   = torch.randn(D, lora_dim, device='cuda', dtype=torch.float32)  # replicated
-    x_row_full = torch.randn(B, S, D, device='cuda', dtype=torch.float32)
+    W_base_row = torch.randn(D, D, device=_accel_device(), dtype=torch.float32)
+    W_down_row = torch.randn(lora_dim, D, device=_accel_device(), dtype=torch.float32)  # full
+    W_up_row   = torch.randn(D, lora_dim, device=_accel_device(), dtype=torch.float32)  # replicated
+    x_row_full = torch.randn(B, S, D, device=_accel_device(), dtype=torch.float32)
     for t in [W_base_row, W_down_row, W_up_row, x_row_full]:
         dist.broadcast(t, src=0, group=group)
 
@@ -468,7 +477,7 @@ def check_lora_forward_math(groups, use_sp: bool = False) -> bool:
     row_base = RowParallelLinear(chunk, D, bias=False, sequence_parallel=use_sp, seq_dim=1)
     row_base.weight = nn.Parameter(W_base_row[:, rank*chunk:(rank+1)*chunk].clone())
     row_base._group = group
-    row_base.cuda()
+    row_base.to(_accel_device())
 
     row_lora = RowParallelLoRAModule(
         "test_row", row_base, 1.0, lora_dim, float(lora_dim),
@@ -476,7 +485,7 @@ def check_lora_forward_math(groups, use_sp: bool = False) -> bool:
     )
     row_lora.lora_down.weight = nn.Parameter(W_down_row[:, rank*chunk:(rank+1)*chunk].clone())
     row_lora.lora_up.weight   = nn.Parameter(W_up_row.clone())   # same on all ranks
-    row_lora.cuda()
+    row_lora.to(_accel_device())
     row_lora.apply_to()   # hooks row_base.forward → row_lora.forward
 
     # RowParallel always receives full-S, D/tp input.

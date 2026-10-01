@@ -19,6 +19,14 @@ except Exception:
     HAS_CUDA = False
 
 try:
+    # torch_npu registers torch.npu; importing it is required for the NPU device
+    import torch_npu  # noqa: F401
+
+    HAS_NPU = torch.npu.is_available()
+except Exception:
+    HAS_NPU = False
+
+try:
     HAS_MPS = torch.backends.mps.is_available()
 except Exception:
     HAS_MPS = False
@@ -33,6 +41,8 @@ def clean_memory():
     gc.collect()
     if HAS_CUDA:
         torch.cuda.empty_cache()
+    if HAS_NPU:
+        torch.npu.empty_cache()
     if HAS_XPU:
         torch.xpu.empty_cache()
     if HAS_MPS:
@@ -51,6 +61,8 @@ def clean_memory_on_device(device: Optional[Union[str, torch.device]]):
     # device may "cuda" or "cuda:0", so we need to check the type of device
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    if device.type == "npu":
+        torch.npu.empty_cache()
     if device.type == "xpu":
         torch.xpu.empty_cache()
     if device.type == "mps":
@@ -64,6 +76,8 @@ def synchronize_device(device: Optional[Union[str, torch.device]]):
         device = torch.device(device)
     if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "npu":
+        torch.npu.synchronize()
     elif device.type == "xpu":
         torch.xpu.synchronize()
     elif device.type == "mps":
@@ -75,7 +89,9 @@ def get_preferred_device() -> torch.device:
     r"""
     Do not call this function from training scripts. Use accelerator.device instead.
     """
-    if HAS_CUDA:
+    if HAS_NPU:
+        device = torch.device("npu")
+    elif HAS_CUDA:
         device = torch.device("cuda")
     elif HAS_XPU:
         device = torch.device("xpu")
@@ -85,6 +101,26 @@ def get_preferred_device() -> torch.device:
         device = torch.device("cpu")
     print(f"get_preferred_device() -> {device}")
     return device
+
+
+def is_oom_error(error: BaseException) -> bool:
+    """
+    Return True when the exception represents an out-of-memory error on any supported
+    accelerator. Ascend NPU (torch_npu) raises RuntimeError rather than a dedicated class.
+    """
+    oom_classes = tuple(
+        cls
+        for cls in (
+            getattr(torch.cuda, "OutOfMemoryError", None),
+            getattr(getattr(torch, "npu", None), "OutOfMemoryError", None),
+        )
+        if isinstance(cls, type)
+    )
+    if oom_classes and isinstance(error, oom_classes):
+        return True
+    if isinstance(error, RuntimeError):
+        return "out of memory" in str(error).lower()
+    return False
 
 
 def init_ipex():

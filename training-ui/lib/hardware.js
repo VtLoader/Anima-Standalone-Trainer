@@ -1,10 +1,21 @@
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const os = require('os');
 const WebSocket = require('ws');
 
 const isWindows = process.platform === 'win32';
 const isWSL = process.platform === 'linux' && !!process.env.WSL_DISTRO_NAME;
 const HW_MONITOR_INTERVAL_MS = 1000;
+
+// Detect Ascend NPU via npu-smi (Linux only). Cached once at startup.
+const hasNpu = (() => {
+    if (isWindows) return false;
+    try {
+        execFileSync('npu-smi', ['info'], { stdio: 'ignore', timeout: 4000 });
+        return true;
+    } catch (_) {
+        return false;
+    }
+})();
 
 let prevCpuInfo = null;
 
@@ -146,7 +157,71 @@ function getCpuTemp() {
     );
 }
 
+// Parse `npu-smi info` table into the same shape as the nvidia-smi query.
+// Each chip is printed on two rows:
+//   | 5  Ascend910 | OK | <power> <temp> ... |
+//   | 0  10       | bus | <aicore> <mem_used> / <mem_total> <hbm_used> / <hbm_total> |
+// (older/newer npu-smi variants may collapse or reorder columns; the parser is tolerant)
+function parseNpuSmi(stdout) {
+    const lines = stdout.split('\n');
+    const stats = [];
+    let pending = null;
+    for (const raw of lines) {
+        if (!raw.trim().startsWith('|')) continue;
+        const parts = raw.split('|').map(s => s.trim());
+        if (parts.length < 5) continue;
+
+        const firstCell = parts[1].split(/\s+/).filter(Boolean);
+        if (firstCell.length < 2) continue;
+        const id = parseInt(firstCell[0]);
+        if (isNaN(id)) continue;
+
+        const secondIsName = !/^\d+$/.test(firstCell[1]);
+        if (secondIsName) {
+            // name row: parts[3] is "<power> <temp> ..." ("-" when power is unavailable)
+            const infoTokens = (parts[3] || '').split(/\s+/).filter(Boolean);
+            const firstNum = parseFloat(infoTokens[0]);
+            const powerDraw = isNaN(firstNum) ? 0 : Math.round(firstNum);
+            const temp = parseInt(infoTokens[1]) || 0;
+            pending = { index: id, name: firstCell[1], powerDraw, temp };
+            continue;
+        }
+
+        // chip row
+        const util = parseInt((parts[3] || '').split(/\s+/)[0]) || 0;
+        const memGroups = (parts.slice(3).join(' ').match(/(\d+)\s*\/\s*(\d+)/g) || []);
+        let memUsed = 0;
+        let memTotal = 0;
+        if (memGroups.length > 0) {
+            // last group is HBM on Ascend 910, single group on some other variants
+            const m = memGroups[memGroups.length - 1].split('/').map(s => parseInt(s.trim()));
+            memUsed = m[0] || 0;
+            memTotal = m[1] || 0;
+        }
+        stats.push({
+            index: id,
+            name: pending ? pending.name : 'Ascend NPU',
+            util,
+            memUsed,
+            memTotal,
+            temp: pending ? pending.temp : 0,
+            powerDraw: pending ? pending.powerDraw : 0,
+            powerLimit: 0,
+        });
+        pending = null;
+    }
+    return stats.length ? stats : null;
+}
+
 function getGpuStats() {
+    if (hasNpu) {
+        return runSingleFlightProbe(
+            gpuStatsProbeState,
+            () => spawn('npu-smi', ['info'], { windowsHide: true }),
+            4000,
+            parseNpuSmi
+        );
+    }
     return runSingleFlightProbe(
         gpuStatsProbeState,
         () => spawn(gpuSmiBinary, [
@@ -211,4 +286,4 @@ function startHardwareMonitor(wss, getActiveGpus) {
     }, HW_MONITOR_INTERVAL_MS);
 }
 
-module.exports = { startHardwareMonitor };
+module.exports = { startHardwareMonitor, parseNpuSmi };
